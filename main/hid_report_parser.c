@@ -1,1034 +1,1022 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <inttypes.h>
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText:  2022 Istvan Pasztor
+// C language version of HID report parser for mouse layout extraction
+#include "hid_report_parser_c.h"
 #include <string.h>
-#include "esp_log.h"
-#include <stdbool.h>
-#include "hid_report_parser.h"
 
-static const char *TAG = "HID_PARSER";
+// HID item constants
+#define ITEM_LONG 0xFE
+#define ITEM_TAG_MASK 0xF0
+#define ITEM_TYPE_MASK 0x0C
+#define ITEM_SIZE_MASK 0x03
+#define ITEM_TAG_AND_TYPE_MASK (ITEM_TAG_MASK | ITEM_TYPE_MASK)
 
-/**
- * @brief Parse and print HID Report Descriptor
- *
- * @param[in] desc    Pointer to HID Report Descriptor data
- * @param[in] length  Length of descriptor data
- */
-void parse_hid_report_descriptor(const uint8_t *desc, size_t length)
+#define ITEM_TYPE_MAIN 0x00
+#define ITEM_TYPE_GLOBAL 0x04
+#define ITEM_TYPE_LOCAL 0x08
+
+// Main items
+#define ITEM_INPUT 0x80
+#define ITEM_OUTPUT 0x90
+#define ITEM_FEATURE 0xB0
+#define ITEM_COLLECTION 0xA0
+#define ITEM_END_COLLECTION 0xC0
+
+// Global items
+#define ITEM_USAGE_PAGE 0x04
+#define ITEM_LOGICAL_MIN 0x14
+#define ITEM_LOGICAL_MAX 0x24
+#define ITEM_REPORT_SIZE 0x74
+#define ITEM_REPORT_ID 0x84
+#define ITEM_REPORT_COUNT 0x94
+#define ITEM_PUSH 0xA4
+#define ITEM_POP 0xB4
+
+// Local items
+#define ITEM_USAGE 0x08
+#define ITEM_USAGE_MIN 0x18
+#define ITEM_USAGE_MAX 0x28
+
+// Field flags
+#define FLAG_FIELD_VARIABLE 0x02
+#define FLAG_FIELD_RELATIVE 0x01
+
+// Local flags
+#define FLAG_USAGE_MIN 0x01
+#define FLAG_USAGE_MAX 0x02
+
+// Maximum values
+#define MAX_USAGE_RANGES 16
+#define MAX_PUSH_POP_STACK 4
+
+// Global state for PUSH/POP stack
+typedef struct
 {
-    if (desc == NULL || length == 0)
+  uint8_t report_id;
+  uint16_t usage_page;
+  int32_t logical_min;
+  int32_t logical_max;
+  uint32_t report_size;
+  uint32_t report_count;
+} global_state_t;
+
+// Usage range structure
+typedef struct
+{
+  uint16_t usage_page;
+  uint16_t usage_min;
+  uint16_t usage_max;
+} usage_range_t;
+
+// Parser state
+typedef struct
+{
+  // Globals
+  uint8_t report_id;
+  uint16_t usage_page;
+  int32_t logical_min;
+  int32_t logical_max;
+  uint32_t report_size;
+  uint32_t report_count;
+
+  // Global stack for PUSH/POP
+  global_state_t global_stack[MAX_PUSH_POP_STACK];
+  int global_stack_size;
+
+  // Locals
+  usage_range_t usage_ranges[MAX_USAGE_RANGES];
+  int num_usage_ranges;
+  uint8_t flags; // FLAG_USAGE_MIN, FLAG_USAGE_MAX
+
+  // Collection state
+  int collection_depth;
+  bool in_mouse_collection;
+
+  // Field tracking
+  uint32_t current_bit_offset;
+  bool first_field_processed;
+  bool first_field_has_report_id;
+
+  // Current report layout being built
+  hid_report_layout_t *current_layout;
+  bool layout_valid;
+} parser_state_t;
+
+// Helper functions
+static bool usage_data(const uint8_t *p, uint8_t data_size, uint16_t *usage, uint16_t *usage_page)
+{
+  *usage_page = 0;
+  *usage = 0;
+  switch (data_size)
+  {
+  case 4:
+    *usage_page = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+    // fall through
+  case 2:
+    *usage |= (uint16_t)p[1] << 8;
+    // fall through
+  case 1:
+    *usage |= p[0];
+    // fall through
+  case 0:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool uint8_data(const uint8_t *p, uint8_t data_size, uint8_t *data)
+{
+  switch (data_size)
+  {
+  case 4:
+    if (p[2] || p[3])
+      return false;
+    // fall through
+  case 2:
+    if (p[1])
+      return false;
+    // fall through
+  case 1:
+    *data = p[0];
+    return true;
+  case 0:
+    *data = 0;
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool uint16_data(const uint8_t *p, uint8_t data_size, uint16_t *data, bool allow_overflow)
+{
+  switch (data_size)
+  {
+  case 4:
+    if (!allow_overflow && (p[2] | p[3]))
+      return false;
+    // fall through
+  case 2:
+    *data = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    return true;
+  case 1:
+    *data = p[0];
+    return true;
+  case 0:
+    *data = 0;
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool uint32_data(const uint8_t *p, uint8_t data_size, uint32_t *data)
+{
+  *data = 0;
+  switch (data_size)
+  {
+  case 4:
+    *data |= ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    // fall through
+  case 2:
+    *data |= (uint32_t)p[1] << 8;
+    // fall through
+  case 1:
+    *data |= p[0];
+    // fall through
+  case 0:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool int32_data(const uint8_t *p, uint8_t data_size, int32_t *data)
+{
+  switch (data_size)
+  {
+  case 4:
+    *data = (int32_t)((int32_t)p[0] | ((int32_t)p[1] << 8) |
+                      ((int32_t)p[2] << 16) | ((int32_t)p[3] << 24));
+    return true;
+  case 2:
+    *data = (int16_t)((int16_t)p[0] | ((int16_t)p[1] << 8));
+    return true;
+  case 1:
+    *data = (int8_t)p[0];
+    return true;
+  case 0:
+    *data = 0;
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void reset_parser(parser_state_t *state)
+{
+  memset(state, 0, sizeof(parser_state_t));
+}
+
+static void reset_locals(parser_state_t *state)
+{
+  state->num_usage_ranges = 0;
+  state->flags = 0;
+}
+
+// AddUsageRange: exactly like C++ version
+// If this range is a continuation of the previously added range
+// then extend the previous range instead of adding a new one.
+// Note: usage_page can be 0 here, it will be set to global usage_page later in process_input_field
+// IMPORTANT: Only extend if the previous range's max + 1 equals the new min AND
+// the previous range was not a single-value range (min == max).
+// This prevents merging separate USAGE items that happen to be consecutive.
+static bool add_usage_range(parser_state_t *state, uint16_t usage_min, uint16_t usage_max, uint16_t usage_page)
+{
+  // Try to extend previous range if contiguous
+  // C++ code directly compares usage_page values, even if they are 0
+  if (state->num_usage_ranges > 0)
+  {
+    usage_range_t *r = &state->usage_ranges[state->num_usage_ranges - 1];
+    // Direct comparison like C++ code - both can be 0
+    // Only extend if pages match and ranges are contiguous
+    // But don't extend single-value ranges (separate USAGE items)
+    if (r->usage_page == usage_page && r->usage_max + 1 == usage_min)
     {
-        ESP_LOGW(TAG, "Invalid descriptor data");
-        return;
+      // Only extend if the previous range was not a single-value range
+      // OR if the new range is also not a single-value range
+      // This allows USAGE_MIN/USAGE_MAX ranges to be extended, but not separate USAGE items
+      if (r->usage_min != r->usage_max || usage_min != usage_max)
+      {
+        r->usage_max = usage_max;
+        return true;
+      }
     }
+  }
 
-    ESP_LOGI(TAG, "\n========== HID Report Descriptor 解析 ==========");
+  if (state->num_usage_ranges >= MAX_USAGE_RANGES)
+    return false;
 
-    size_t offset = 0;
-    int indent_level = 0;
-    uint32_t usage_page = 0;
-    uint32_t logical_min = 0, logical_max = 0;
-    uint32_t physical_min = 0, physical_max = 0;
-    uint32_t report_size = 0, report_count = 0;
-    uint32_t unit = 0, unit_exponent = 0;
+  usage_range_t *r = &state->usage_ranges[state->num_usage_ranges++];
+  r->usage_min = usage_min;
+  r->usage_max = usage_max;
+  r->usage_page = usage_page; // Can be 0, will be set later
+  return true;
+}
 
-    while (offset < length)
+// Process input field - following C++ AddField logic exactly
+static int process_input_field(parser_state_t *state, const uint8_t *p_data, uint8_t data_size, uint16_t flags)
+{
+  if (!state->current_layout)
+  {
+    return 0; // No layout to fill
+  }
+
+  // Calculate bit_size exactly like C++
+  uint32_t bit_size = state->report_size * state->report_count;
+
+  // HID specification: If an item has no controls (Report Count = 0),
+  // the Local item tags apply to the Main item (usually a collection item).
+  // We silently ignore this zero sized "field".
+  if (bit_size == 0)
+    return 0;
+
+  // Check report ID consistency
+  if (state->first_field_processed)
+  {
+    if (state->first_field_has_report_id != (state->report_id != 0))
     {
-        uint8_t item = desc[offset];
-        uint8_t item_type = (item >> 2) & 0x03; // 0=Main, 1=Global, 2=Local, 3=Reserved
-        uint8_t item_tag = (item >> 4) & 0x0F;
-        uint8_t item_size = item & 0x03; // 0=0字节, 1=1字节, 2=2字节, 3=4字节
+      return -1; // Bad report ID assignment
+    }
+  }
+  else
+  {
+    state->first_field_has_report_id = (state->report_id != 0);
+    state->first_field_processed = true;
+  }
 
-        if (offset + item_size >= length)
-        {
-            ESP_LOGW(TAG, "Descriptor truncated at offset %zu", offset);
-            break;
-        }
+  // If no usage ranges, this is padding - skip it but advance bit offset
+  if (!state->num_usage_ranges)
+  {
+    state->current_bit_offset += bit_size;
+    return 0;
+  }
 
-        uint32_t item_value = 0;
-        if (item_size == 1)
-        {
-            item_value = desc[offset + 1];
-        }
-        else if (item_size == 2)
-        {
-            item_value = desc[offset + 1] | (desc[offset + 2] << 8);
-        }
-        else if (item_size == 3)
-        {
-            item_value = desc[offset + 1] | (desc[offset + 2] << 8) |
-                         (desc[offset + 3] << 16) | (desc[offset + 4] << 24);
-        }
+  // Check logical min/max
+  if ((state->logical_min < 0 && state->logical_max < state->logical_min) ||
+      (state->logical_min >= 0 && (uint32_t)state->logical_max < (uint32_t)state->logical_min))
+  {
+    return -1; // Logical min is greater than max
+  }
 
-        // 打印缩进
-        for (int i = 0; i < indent_level; i++)
-        {
-            printf("  ");
-        }
+  // Read flags
+  uint16_t field_flags = 0;
+  if (!uint16_data(p_data, data_size, &field_flags, true))
+  {
+    return -1;
+  }
 
-        // 解析不同类型的项目
-        if (item_type == 0) // Main Items
+  // CRITICAL: In case of an extended USAGE or USAGE_MIN/MAX the usage_page field is
+  // set immediately. A normal USAGE or USAGE_MIN/MAX item leaves the usage_page zero
+  // and the parser sets it to the value of _globals.usage_page when a main item is
+  // encountered as per specification.
+  // This is done BEFORE processing the field!
+  for (int i = 0; i < state->num_usage_ranges; i++)
+  {
+    if (state->usage_ranges[i].usage_page == 0)
+    {
+      if (state->usage_page == 0)
+      {
+        return -1; // Undefined usage page
+      }
+      state->usage_ranges[i].usage_page = state->usage_page;
+    }
+  }
+
+  // Now process the field
+  bool is_variable = (field_flags & FLAG_FIELD_VARIABLE) != 0;
+  bool is_relative = (field_flags & FLAG_FIELD_RELATIVE) != 0;
+
+  // Check if this field has mouse-related usages
+  bool has_mouse_usage = false;
+  if (state->in_mouse_collection)
+  {
+    has_mouse_usage = true;
+  }
+  else
+  {
+    // Check if any usage in usage_ranges is mouse-related
+    for (int i = 0; i < state->num_usage_ranges; i++)
+    {
+      uint16_t page = state->usage_ranges[i].usage_page;
+      if (page == PAGE_GENERIC_DESKTOP || page == PAGE_BUTTON || page == PAGE_CONSUMER)
+      {
+        has_mouse_usage = true;
+        break;
+      }
+    }
+  }
+
+  // Skip non-mouse fields
+  if (!has_mouse_usage)
+  {
+    state->current_bit_offset += bit_size;
+    return 0;
+  }
+
+  // Process each usage range
+  // For variable fields: each usage_range corresponds to one item in report_count
+  // For array fields: usages map to array indices
+  uint32_t usage_index = 0;
+  for (int i = 0; i < state->num_usage_ranges; i++)
+  {
+    uint16_t page = state->usage_ranges[i].usage_page;
+    uint16_t usage_min = state->usage_ranges[i].usage_min;
+    uint16_t usage_max = state->usage_ranges[i].usage_max;
+
+    if (is_variable)
+    {
+      // For variable fields, each usage_range gets one usage_index
+      // We use usage_min as the representative usage for the range
+      // usage_index corresponds to the position in report_count
+      if (usage_index >= state->report_count)
+        break; // No more slots in report_count
+
+      uint32_t field_bit_offset = state->current_bit_offset + (usage_index * state->report_size);
+      usage_index++;
+
+      // Process buttons (Button Page)
+      if (page == PAGE_BUTTON && usage_min >= 1)
+      {
+        if (!state->layout_valid)
         {
-            switch (item_tag)
-            {
-            case 0x08: // Input
-                printf("Input(");
-                if (item_value & 0x01)
-                    printf("Data,");
-                else
-                    printf("Constant,");
-                if (item_value & 0x02)
-                    printf("Variable,");
-                else
-                    printf("Array,");
-                if (item_value & 0x04)
-                    printf("Absolute,");
-                else
-                    printf("Relative,");
-                if (item_value & 0x08)
-                    printf("Wrap,");
-                if (item_value & 0x10)
-                    printf("Non-linear,");
-                if (item_value & 0x20)
-                    printf("No preferred state,");
-                if (item_value & 0x40)
-                    printf("Null state,");
-                if (item_value & 0x80)
-                    printf("Volatile,");
-                printf(")");
-                printf(" // Size=%" PRIu32 ", Count=%" PRIu32, report_size, report_count);
-                break;
-            case 0x09: // Output
-                printf("Output(");
-                if (item_value & 0x01)
-                    printf("Data,");
-                else
-                    printf("Constant,");
-                if (item_value & 0x02)
-                    printf("Variable,");
-                else
-                    printf("Array,");
-                if (item_value & 0x04)
-                    printf("Absolute,");
-                else
-                    printf("Relative,");
-                if (item_value & 0x08)
-                    printf("Wrap,");
-                if (item_value & 0x10)
-                    printf("Non-linear,");
-                if (item_value & 0x20)
-                    printf("No preferred state,");
-                if (item_value & 0x40)
-                    printf("Null state,");
-                if (item_value & 0x80)
-                    printf("Volatile,");
-                printf(")");
-                printf(" // Size=%" PRIu32 ", Count=%" PRIu32, report_size, report_count);
-                break;
-            case 0x0B: // Feature
-                printf("Feature(");
-                if (item_value & 0x01)
-                    printf("Data,");
-                else
-                    printf("Constant,");
-                if (item_value & 0x02)
-                    printf("Variable,");
-                else
-                    printf("Array,");
-                if (item_value & 0x04)
-                    printf("Absolute,");
-                else
-                    printf("Relative,");
-                if (item_value & 0x08)
-                    printf("Wrap,");
-                if (item_value & 0x10)
-                    printf("Non-linear,");
-                if (item_value & 0x20)
-                    printf("No preferred state,");
-                if (item_value & 0x40)
-                    printf("Null state,");
-                if (item_value & 0x80)
-                    printf("Volatile,");
-                printf(")");
-                printf(" // Size=%" PRIu32 ", Count=%" PRIu32, report_size, report_count);
-                break;
-            case 0x0A: // Collection
-                printf("Collection(");
-                switch (item_value)
-                {
-                case 0x00:
-                    printf("Physical");
-                    break;
-                case 0x01:
-                    printf("Application");
-                    break;
-                case 0x02:
-                    printf("Logical");
-                    break;
-                case 0x03:
-                    printf("Report");
-                    break;
-                case 0x04:
-                    printf("Named Array");
-                    break;
-                case 0x05:
-                    printf("Usage Switch");
-                    break;
-                case 0x06:
-                    printf("Usage Modifier");
-                    break;
-                default:
-                    printf("0x%02X", (uint8_t)item_value);
-                    break;
-                }
-                printf(")");
-                indent_level++;
-                break;
-            case 0x0C: // End Collection
-                indent_level--;
-                if (indent_level < 0)
-                    indent_level = 0;
-                printf("End Collection");
-                break;
-            default:
-                printf("Main Item(0x%02X, 0x%02X)", item, (uint8_t)item_value);
-                break;
-            }
-        }
-        else if (item_type == 1) // Global Items
-        {
-            switch (item_tag)
-            {
-            case 0x00: // Usage Page
-                usage_page = item_value;
-                printf("Usage Page(");
-                switch (usage_page)
-                {
-                case 0x01:
-                    printf("Generic Desktop");
-                    break;
-                case 0x02:
-                    printf("Simulation Controls");
-                    break;
-                case 0x03:
-                    printf("VR Controls");
-                    break;
-                case 0x04:
-                    printf("Sport Controls");
-                    break;
-                case 0x05:
-                    printf("Game Controls");
-                    break;
-                case 0x06:
-                    printf("Generic Device Controls");
-                    break;
-                case 0x07:
-                    printf("Keyboard/Keypad");
-                    break;
-                case 0x08:
-                    printf("LEDs");
-                    break;
-                case 0x09:
-                    printf("Button");
-                    break;
-                case 0x0A:
-                    printf("Ordinal");
-                    break;
-                case 0x0B:
-                    printf("Telephony");
-                    break;
-                case 0x0C:
-                    printf("Consumer");
-                    break;
-                case 0x0D:
-                    printf("Digitizer");
-                    break;
-                case 0x0E:
-                    printf("Haptics");
-                    break;
-                case 0x0F:
-                    printf("PID Page");
-                    break;
-                case 0x10:
-                    printf("Unicode");
-                    break;
-                case 0x14:
-                    printf("Eye and Head Trackers");
-                    break;
-                case 0x40:
-                    printf("Vendor-defined 0x40");
-                    break;
-                case 0x80:
-                    printf("Vendor-defined 0x80");
-                    break;
-                case 0x83:
-                    printf("Reserved");
-                    break;
-                case 0x84:
-                    printf("Power");
-                    break;
-                case 0x85:
-                    printf("Battery System");
-                    break;
-                case 0x8C:
-                    printf("Bar Code Scanner");
-                    break;
-                case 0x8D:
-                    printf("Scale");
-                    break;
-                case 0x8E:
-                    printf("Magnetic Stripe Reader");
-                    break;
-                case 0x8F:
-                    printf("Reserved Point of Sale");
-                    break;
-                case 0x90:
-                    printf("Camera Control");
-                    break;
-                case 0x91:
-                    printf("Arcade");
-                    break;
-                default:
-                    printf("0x%04X", (uint16_t)usage_page);
-                    break;
-                }
-                printf(")");
-                break;
-            case 0x01: // Logical Minimum
-                logical_min = item_value;
-                // 根据数据大小判断是否为有符号数
-                if (item_size == 1 && (item_value & 0x80))
-                {
-                    int8_t signed_min = (int8_t)(uint8_t)item_value;
-                    printf("Logical Minimum(%d)", (int)signed_min);
-                }
-                else if (item_size == 2 && (item_value & 0x8000))
-                {
-                    int16_t signed_min = (int16_t)(uint16_t)item_value;
-                    printf("Logical Minimum(%d)", (int)signed_min);
-                }
-                else if (item_size == 3 && (item_value & 0x80000000))
-                {
-                    int32_t signed_min = (int32_t)item_value;
-                    printf("Logical Minimum(%" PRId32 ")", signed_min);
-                }
-                else
-                {
-                    printf("Logical Minimum(%" PRIu32 ")", logical_min);
-                }
-                break;
-            case 0x02: // Logical Maximum
-                logical_max = item_value;
-                // 根据数据大小判断是否为有符号数
-                if (item_size == 1 && (item_value & 0x80))
-                {
-                    int8_t signed_max = (int8_t)(uint8_t)item_value;
-                    printf("Logical Maximum(%d)", (int)signed_max);
-                }
-                else if (item_size == 2 && (item_value & 0x8000))
-                {
-                    int16_t signed_max = (int16_t)(uint16_t)item_value;
-                    printf("Logical Maximum(%d)", (int)signed_max);
-                }
-                else if (item_size == 3 && (item_value & 0x80000000))
-                {
-                    int32_t signed_max = (int32_t)item_value;
-                    printf("Logical Maximum(%" PRId32 ")", signed_max);
-                }
-                else
-                {
-                    printf("Logical Maximum(%" PRIu32 ")", logical_max);
-                }
-                break;
-            case 0x03: // Physical Minimum
-                physical_min = item_value;
-                printf("Physical Minimum(%" PRIu32 ")", physical_min);
-                break;
-            case 0x04: // Physical Maximum
-                physical_max = item_value;
-                printf("Physical Maximum(%" PRIu32 ")", physical_max);
-                break;
-            case 0x05: // Unit Exponent
-                unit_exponent = item_value;
-                printf("Unit Exponent(%" PRIu32 ")", unit_exponent);
-                break;
-            case 0x06: // Unit
-                unit = item_value;
-                printf("Unit(0x%08" PRIX32 ")", (unsigned long)unit);
-                break;
-            case 0x07: // Report Size
-                report_size = item_value;
-                printf("Report Size(%" PRIu32 ")", report_size);
-                break;
-            case 0x08: // Report Count
-                report_count = item_value;
-                printf("Report Count(%" PRIu32 ")", report_count);
-                break;
-            case 0x09: // Report ID
-                printf("Report ID(%" PRIu32 ")", item_value);
-                break;
-            case 0x0A: // Push
-                printf("Push");
-                break;
-            case 0x0B: // Pop
-                printf("Pop");
-                break;
-            default:
-                printf("Global Item(0x%02X, 0x%02X)", item, (uint8_t)item_value);
-                break;
-            }
-        }
-        else if (item_type == 2) // Local Items
-        {
-            switch (item_tag)
-            {
-            case 0x00: // Usage
-                printf("Usage(");
-                if (usage_page == 0x01) // Generic Desktop
-                {
-                    switch (item_value)
-                    {
-                    case 0x00:
-                        printf("Undefined");
-                        break;
-                    case 0x01:
-                        printf("Pointer");
-                        break;
-                    case 0x02:
-                        printf("Mouse");
-                        break;
-                    case 0x04:
-                        printf("Joystick");
-                        break;
-                    case 0x05:
-                        printf("Game Pad");
-                        break;
-                    case 0x06:
-                        printf("Keyboard");
-                        break;
-                    case 0x07:
-                        printf("Keypad");
-                        break;
-                    case 0x08:
-                        printf("Multi-axis Controller");
-                        break;
-                    case 0x30:
-                        printf("X");
-                        break;
-                    case 0x31:
-                        printf("Y");
-                        break;
-                    case 0x32:
-                        printf("Z");
-                        break;
-                    case 0x33:
-                        printf("Rx");
-                        break;
-                    case 0x34:
-                        printf("Ry");
-                        break;
-                    case 0x35:
-                        printf("Rz");
-                        break;
-                    case 0x36:
-                        printf("Slider");
-                        break;
-                    case 0x37:
-                        printf("Dial");
-                        break;
-                    case 0x38:
-                        printf("Wheel");
-                        break;
-                    case 0x39:
-                        printf("Hat Switch");
-                        break;
-                    case 0x3A:
-                        printf("Counted Buffer");
-                        break;
-                    case 0x3B:
-                        printf("Byte Count");
-                        break;
-                    case 0x3C:
-                        printf("Motion Wakeup");
-                        break;
-                    case 0x3D:
-                        printf("Start");
-                        break;
-                    case 0x3E:
-                        printf("Select");
-                        break;
-                    case 0x40:
-                        printf("Vx");
-                        break;
-                    case 0x41:
-                        printf("Vy");
-                        break;
-                    case 0x42:
-                        printf("Vz");
-                        break;
-                    case 0x43:
-                        printf("Vbrx");
-                        break;
-                    case 0x44:
-                        printf("Vbry");
-                        break;
-                    case 0x45:
-                        printf("Vbrz");
-                        break;
-                    case 0x46:
-                        printf("Vno");
-                        break;
-                    case 0x80:
-                        printf("System Control");
-                        break;
-                    case 0x81:
-                        printf("System Power Down");
-                        break;
-                    case 0x82:
-                        printf("System Sleep");
-                        break;
-                    case 0x83:
-                        printf("System Wake Up");
-                        break;
-                    case 0x84:
-                        printf("System Context Menu");
-                        break;
-                    case 0x85:
-                        printf("System Main Menu");
-                        break;
-                    case 0x86:
-                        printf("System App Menu");
-                        break;
-                    case 0x87:
-                        printf("System Menu Help");
-                        break;
-                    case 0x88:
-                        printf("System Menu Exit");
-                        break;
-                    case 0x89:
-                        printf("System Menu Select");
-                        break;
-                    case 0x8A:
-                        printf("System Menu Right");
-                        break;
-                    case 0x8B:
-                        printf("System Menu Left");
-                        break;
-                    case 0x8C:
-                        printf("System Menu Up");
-                        break;
-                    case 0x8D:
-                        printf("System Menu Down");
-                        break;
-                    case 0x90:
-                        printf("D-pad Up");
-                        break;
-                    case 0x91:
-                        printf("D-pad Down");
-                        break;
-                    case 0x92:
-                        printf("D-pad Right");
-                        break;
-                    case 0x93:
-                        printf("D-pad Left");
-                        break;
-                    default:
-                        printf("0x%04X", (uint16_t)item_value);
-                        break;
-                    }
-                }
-                else if (usage_page == 0x09) // Button
-                {
-                    printf("Button %" PRIu32, item_value);
-                }
-                else if (usage_page == 0x07) // Keyboard/Keypad
-                {
-                    printf("0x%04X", (uint16_t)item_value);
-                }
-                else
-                {
-                    printf("0x%04X", (uint16_t)item_value);
-                }
-                printf(")");
-                break;
-            case 0x01: // Usage Minimum
-                printf("Usage Minimum(");
-                if (usage_page == 0x09) // Button
-                {
-                    printf("Button %" PRIu32, item_value);
-                }
-                else
-                {
-                    printf("0x%04X", (uint16_t)item_value);
-                }
-                printf(")");
-                break;
-            case 0x02: // Usage Maximum
-                printf("Usage Maximum(");
-                if (usage_page == 0x09) // Button
-                {
-                    printf("Button %" PRIu32, item_value);
-                }
-                else
-                {
-                    printf("0x%04X", (uint16_t)item_value);
-                }
-                printf(")");
-                break;
-            case 0x03: // Designator Index
-                printf("Designator Index(%" PRIu32 ")", item_value);
-                break;
-            case 0x04: // Designator Minimum
-                printf("Designator Minimum(%" PRIu32 ")", item_value);
-                break;
-            case 0x05: // Designator Maximum
-                printf("Designator Maximum(%" PRIu32 ")", item_value);
-                break;
-            case 0x07: // String Index
-                printf("String Index(%" PRIu32 ")", item_value);
-                break;
-            case 0x08: // String Minimum
-                printf("String Minimum(%" PRIu32 ")", item_value);
-                break;
-            case 0x09: // String Maximum
-                printf("String Maximum(%" PRIu32 ")", item_value);
-                break;
-            case 0x0A: // Delimiter
-                printf("Delimiter(%" PRIu32 ")", item_value);
-                break;
-            default:
-                printf("Local Item(0x%02X, 0x%02X)", item, (uint8_t)item_value);
-                break;
-            }
+          state->current_layout->report_id = state->report_id;
+          state->current_layout->buttons_bit_offset = state->current_bit_offset;
+          state->current_layout->buttons_count = state->report_count;
+          state->layout_valid = true;
         }
         else
         {
-            printf("Reserved Item(0x%02X, 0x%02X)", item, (uint8_t)item_value);
+          // Extend button count if needed
+          if (state->report_count > state->current_layout->buttons_count)
+          {
+            state->current_layout->buttons_count = state->report_count;
+          }
         }
+      }
 
-        // 打印原始字节
-        printf(" // ");
-        for (int i = 0; i <= item_size; i++)
-        {
-            printf("%02X ", desc[offset + i]);
-        }
-        printf("\n");
+      // Process X axis
+      if (page == PAGE_GENERIC_DESKTOP && usage_min == USAGE_X)
+      {
+        state->current_layout->x_bit_offset = field_bit_offset;
+        state->current_layout->x_size = state->report_size;
+        state->layout_valid = true;
+      }
 
-        offset += item_size + 1;
+      // Process Y axis
+      if (page == PAGE_GENERIC_DESKTOP && usage_min == USAGE_Y)
+      {
+        state->current_layout->y_bit_offset = field_bit_offset;
+        state->current_layout->y_size = state->report_size;
+        state->layout_valid = true;
+      }
+
+      // Process wheel (vertical scroll)
+      if (page == PAGE_GENERIC_DESKTOP && usage_min == USAGE_WHEEL)
+      {
+        state->current_layout->wheel_bit_offset = field_bit_offset;
+        state->current_layout->wheel_size = state->report_size;
+        state->layout_valid = true;
+      }
+
+      // Process pan (horizontal scroll) - Consumer Page
+      if (page == PAGE_CONSUMER && usage_min == USAGE_CONSUMER_AC_PAN)
+      {
+        state->current_layout->pan_bit_offset = field_bit_offset;
+        state->current_layout->pan_size = state->report_size;
+        state->layout_valid = true;
+      }
     }
+    else
+    {
+      // Array field - all usages share the same offset
+      // Check if the range contains any mouse-related usage
+      uint16_t range_end = usage_max < usage_min ? usage_min : usage_max;
+      uint32_t field_bit_offset = state->current_bit_offset;
 
-    ESP_LOGI(TAG, "========== 解析完成 ==========\n");
+      // Process buttons (Button Page)
+      if (page == PAGE_BUTTON && usage_min >= 1)
+      {
+        uint32_t range_length = (uint32_t)range_end - (uint32_t)usage_min + 1;
+        if (!state->layout_valid)
+        {
+          state->current_layout->report_id = state->report_id;
+          state->current_layout->buttons_bit_offset = field_bit_offset;
+          state->current_layout->buttons_count = range_length;
+          state->layout_valid = true;
+        }
+        else
+        {
+          // Extend button count if needed
+          if (range_length > state->current_layout->buttons_count)
+          {
+            state->current_layout->buttons_count = range_length;
+          }
+        }
+      }
+
+      // Process X axis - check if range contains USAGE_X
+      if (page == PAGE_GENERIC_DESKTOP && usage_min <= USAGE_X && USAGE_X <= range_end)
+      {
+        state->current_layout->x_bit_offset = field_bit_offset;
+        state->current_layout->x_size = state->report_size;
+        state->layout_valid = true;
+      }
+
+      // Process Y axis - check if range contains USAGE_Y
+      if (page == PAGE_GENERIC_DESKTOP && usage_min <= USAGE_Y && USAGE_Y <= range_end)
+      {
+        state->current_layout->y_bit_offset = field_bit_offset;
+        state->current_layout->y_size = state->report_size;
+        state->layout_valid = true;
+      }
+
+      // Process wheel (vertical scroll) - check if range contains USAGE_WHEEL
+      if (page == PAGE_GENERIC_DESKTOP && usage_min <= USAGE_WHEEL && USAGE_WHEEL <= range_end)
+      {
+        state->current_layout->wheel_bit_offset = field_bit_offset;
+        state->current_layout->wheel_size = state->report_size;
+        state->layout_valid = true;
+      }
+
+      // Process pan (horizontal scroll) - Consumer Page
+      if (page == PAGE_CONSUMER && usage_min <= USAGE_CONSUMER_AC_PAN && USAGE_CONSUMER_AC_PAN <= range_end)
+      {
+        state->current_layout->pan_bit_offset = field_bit_offset;
+        state->current_layout->pan_size = state->report_size;
+        state->layout_valid = true;
+      }
+    }
+  }
+
+  state->current_bit_offset += bit_size;
+  return 0;
 }
 
-int parse_hid_report_descriptor_layout(const uint8_t *desc, size_t length, hid_report_layout_t *out_layout)
+static int parse_main_item(parser_state_t *state, uint8_t item, const uint8_t *p_data, uint8_t data_size)
 {
-    if (desc == NULL || length == 0 || out_layout == NULL)
+  switch (item)
+  {
+  case ITEM_COLLECTION:
+  {
+    uint8_t collection_type;
+    if (!uint8_data(p_data, data_size, &collection_type))
     {
+      return -1;
+    }
+    state->collection_depth++;
+
+    // Check if this is a mouse collection
+    // Use FirstUsage() logic: get first usage from usage_ranges
+    if (collection_type == COLLECTION_TYPE_APPLICATION && state->num_usage_ranges > 0)
+    {
+      uint16_t first_usage = state->usage_ranges[0].usage_min;
+      uint16_t first_page = state->usage_ranges[0].usage_page;
+      if (first_page == 0)
+        first_page = state->usage_page;
+
+      if (first_page == PAGE_GENERIC_DESKTOP && first_usage == USAGE_MOUSE)
+      {
+        state->in_mouse_collection = true;
+      }
+    }
+    return 0;
+  }
+
+  case ITEM_END_COLLECTION:
+    if (state->collection_depth == 0)
+    {
+      return -1;
+    }
+    state->collection_depth--;
+    if (state->collection_depth == 0)
+    {
+      state->in_mouse_collection = false;
+    }
+    return 0;
+
+  case ITEM_INPUT:
+  {
+    uint16_t flags = 0;
+    if (!uint16_data(p_data, data_size, &flags, true))
+    {
+      return -1;
+    }
+    int res = process_input_field(state, p_data, data_size, flags);
+    // Reset locals after processing INPUT (like C++ does)
+    reset_locals(state);
+    return res;
+  }
+
+  case ITEM_OUTPUT:
+  case ITEM_FEATURE:
+    // Skip output and feature items, but still advance bit offset
+    // Reset locals after processing (like C++ does)
+    reset_locals(state);
+    return 0;
+
+  default:
+    return 0;
+  }
+}
+
+static int parse_global_item(parser_state_t *state, uint8_t item, const uint8_t *p_data, uint8_t data_size)
+{
+  switch (item)
+  {
+  case ITEM_USAGE_PAGE:
+    return uint16_data(p_data, data_size, &state->usage_page, false) ? 0 : -1;
+
+  case ITEM_LOGICAL_MIN:
+    return int32_data(p_data, data_size, &state->logical_min) ? 0 : -1;
+
+  case ITEM_LOGICAL_MAX:
+  {
+    // Workaround for sign extension issues (exactly like C++)
+    if (state->logical_min >= 0)
+    {
+      uint32_t max_u32;
+      if (!uint32_data(p_data, data_size, &max_u32))
         return -1;
+      state->logical_max = (int32_t)max_u32;
     }
-    // We'll collect per-report information and then select appropriate layout(s).
-    // Support up to 256 report IDs (0..255)
-    hid_report_layout_t tmp_layouts[256];
-    uint8_t report_used[256] = {0};
-    uint32_t report_bits[256];
-    for (int i = 0; i < 256; i++)
+    else
     {
-        memset(&tmp_layouts[i], 0, sizeof(hid_report_layout_t));
-        report_bits[i] = 0;
+      if (!int32_data(p_data, data_size, &state->logical_max))
+        return -1;
+      if (state->logical_max < state->logical_min)
+      {
+        uint32_t max_u32;
+        if (!uint32_data(p_data, data_size, &max_u32))
+          return -1;
+        state->logical_max = (int32_t)max_u32;
+      }
     }
+    return 0;
+  }
 
-    size_t offset = 0;
-    uint32_t usage_page = 0;
-    uint32_t report_size = 0, report_count = 0;
-    uint8_t current_report_id = 0;
+  case ITEM_REPORT_SIZE:
+    return uint32_data(p_data, data_size, &state->report_size) ? 0 : -1;
 
-    // Local items
-    uint32_t last_usage = 0;
-    uint32_t usage_min = 0, usage_max = 0;
-    bool have_usage_min_max = false;
+  case ITEM_REPORT_ID:
+    return uint8_data(p_data, data_size, &state->report_id) ? 0 : -1;
 
-    while (offset < length)
+  case ITEM_REPORT_COUNT:
+    return uint32_data(p_data, data_size, &state->report_count) ? 0 : -1;
+
+  case ITEM_PUSH:
+    if (state->global_stack_size >= MAX_PUSH_POP_STACK)
     {
-        uint8_t item = desc[offset];
-        uint8_t item_type = (item >> 2) & 0x03; // 0=Main,1=Global,2=Local
-        uint8_t item_tag = (item >> 4) & 0x0F;
-        uint8_t item_size = item & 0x03; // 0,1,2,3(==4)
-
-        size_t payload_bytes = (item_size == 3) ? 4 : item_size;
-
-        if (offset + payload_bytes >= length)
-        {
-            break;
-        }
-
-        uint32_t item_value = 0;
-        for (size_t i = 0; i < payload_bytes; i++)
-        {
-            item_value |= ((uint32_t)desc[offset + 1 + i]) << (8 * i);
-        }
-
-        if (item_type == 1) // Global
-        {
-            switch (item_tag)
-            {
-            case 0x00: // Usage Page
-                usage_page = item_value;
-                break;
-            case 0x07: // Report Size
-                report_size = item_value;
-                break;
-            case 0x08: // Report Count
-                report_count = item_value;
-                break;
-            case 0x09: // Report ID
-                current_report_id = (uint8_t)item_value;
-                // initialize report_bits if first seen
-                if (!report_used[current_report_id])
-                {
-                    report_used[current_report_id] = 1;
-                    report_bits[current_report_id] = current_report_id ? 8 : 0;
-                    tmp_layouts[current_report_id].report_id = current_report_id;
-                }
-                break;
-            default:
-                break;
-            }
-        }
-        else if (item_type == 2) // Local
-        {
-            switch (item_tag)
-            {
-            case 0x00: // Usage
-                last_usage = item_value;
-                have_usage_min_max = false;
-                break;
-            case 0x01: // Usage Minimum
-                usage_min = item_value;
-                have_usage_min_max = true;
-                break;
-            case 0x02: // Usage Maximum
-                usage_max = item_value;
-                have_usage_min_max = true;
-                break;
-            default:
-                break;
-            }
-        }
-        else if (item_type == 0) // Main
-        {
-            switch (item_tag)
-            {
-            case 0x08: // Input
-            {
-                // Only consider Data fields (bit 0 == 1). Skip Constant fields.
-                if ((item_value & 0x01) == 0)
-                {
-                    // advance bit offset anyway (constants also occupy bits)
-                    if (report_used[current_report_id])
-                        report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
-                    last_usage = 0;
-                    have_usage_min_max = false;
-                    break;
-                }
-
-                // Ensure current report is marked
-                if (!report_used[current_report_id])
-                {
-                    report_used[current_report_id] = 1;
-                    report_bits[current_report_id] = current_report_id ? 8 : 0;
-                    tmp_layouts[current_report_id].report_id = current_report_id;
-                }
-
-                uint32_t base_bit = report_bits[current_report_id];
-
-                if (usage_page == 0x09)
-                {
-                    // Buttons
-                    if (tmp_layouts[current_report_id].buttons_count == 0)
-                    {
-                        tmp_layouts[current_report_id].buttons_bit_offset = base_bit;
-                        tmp_layouts[current_report_id].buttons_count = (uint16_t)report_count;
-                    }
-                }
-                else if (usage_page == 0x01)
-                {
-                    if (have_usage_min_max)
-                    {
-                        for (uint32_t u = usage_min; u <= usage_max; u++)
-                        {
-                            if (u == 0x30) // X
-                            {
-                                if (tmp_layouts[current_report_id].x_size == 0)
-                                {
-                                    tmp_layouts[current_report_id].x_bit_offset = base_bit + (u - usage_min) * report_size;
-                                    tmp_layouts[current_report_id].x_size = report_size;
-                                }
-                            }
-                            else if (u == 0x31) // Y
-                            {
-                                if (tmp_layouts[current_report_id].y_size == 0)
-                                {
-                                    tmp_layouts[current_report_id].y_bit_offset = base_bit + (u - usage_min) * report_size;
-                                    tmp_layouts[current_report_id].y_size = report_size;
-                                }
-                            }
-                            else if (u == 0x38) // Wheel
-                            {
-                                if (tmp_layouts[current_report_id].wheel_size == 0)
-                                {
-                                    tmp_layouts[current_report_id].wheel_bit_offset = base_bit + (u - usage_min) * report_size;
-                                    tmp_layouts[current_report_id].wheel_size = report_size;
-                                }
-                            }
-                        }
-                    }
-                    else if (last_usage)
-                    {
-                        uint32_t u = last_usage;
-                        if (u == 0x30) // X
-                        {
-                            if (tmp_layouts[current_report_id].x_size == 0)
-                            {
-                                tmp_layouts[current_report_id].x_bit_offset = base_bit;
-                                tmp_layouts[current_report_id].x_size = report_size;
-                            }
-                        }
-                        else if (u == 0x31) // Y
-                        {
-                            if (tmp_layouts[current_report_id].y_size == 0)
-                            {
-                                tmp_layouts[current_report_id].y_bit_offset = base_bit;
-                                tmp_layouts[current_report_id].y_size = report_size;
-                            }
-                        }
-                        else if (u == 0x38) // Wheel
-                        {
-                            if (tmp_layouts[current_report_id].wheel_size == 0)
-                            {
-                                tmp_layouts[current_report_id].wheel_bit_offset = base_bit;
-                                tmp_layouts[current_report_id].wheel_size = report_size;
-                            }
-                        }
-                    }
-                }
-
-                // advance bit offset
-                report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
-
-                // Clear local items per HID spec
-                last_usage = 0;
-                have_usage_min_max = false;
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        offset += 1 + payload_bytes;
+      return -1;
     }
+    state->global_stack[state->global_stack_size].report_id = state->report_id;
+    state->global_stack[state->global_stack_size].usage_page = state->usage_page;
+    state->global_stack[state->global_stack_size].logical_min = state->logical_min;
+    state->global_stack[state->global_stack_size].logical_max = state->logical_max;
+    state->global_stack[state->global_stack_size].report_size = state->report_size;
+    state->global_stack[state->global_stack_size].report_count = state->report_count;
+    state->global_stack_size++;
+    return 0;
 
-    // Select a single layout as legacy behavior: prefer a report that has buttons + x + y.
-    for (int rid = 0; rid < 256; rid++)
+  case ITEM_POP:
+    if (state->global_stack_size == 0)
     {
-        if (report_used[rid])
-        {
-            tmp_layouts[rid].report_size_bits = report_bits[rid];
-            // return first layout that has buttons + x + y
-            if (tmp_layouts[rid].buttons_count > 0 && tmp_layouts[rid].x_size > 0 && tmp_layouts[rid].y_size > 0)
-            {
-                // copy to out
-                memcpy(out_layout, &tmp_layouts[rid], sizeof(hid_report_layout_t));
-                return 0;
-            }
-        }
+      return -1;
     }
+    state->global_stack_size--;
+    state->report_id = state->global_stack[state->global_stack_size].report_id;
+    state->usage_page = state->global_stack[state->global_stack_size].usage_page;
+    state->logical_min = state->global_stack[state->global_stack_size].logical_min;
+    state->logical_max = state->global_stack[state->global_stack_size].logical_max;
+    state->report_size = state->global_stack[state->global_stack_size].report_size;
+    state->report_count = state->global_stack[state->global_stack_size].report_count;
+    return 0;
 
-    // fallback: if any layout had data fields, return the first one
-    for (int rid = 0; rid < 256; rid++)
-    {
-        if (report_used[rid])
-        {
-            memcpy(out_layout, &tmp_layouts[rid], sizeof(hid_report_layout_t));
-            return -1;
-        }
-    }
-
-    return -1;
+  default:
+    return 0;
+  }
 }
 
-int parse_hid_report_descriptor_layouts(const uint8_t *desc, size_t length, hid_report_layout_t *layouts, size_t max_layouts)
+// ParseLocalItems: exactly like C++ version
+static int parse_local_item(parser_state_t *state, uint8_t item, const uint8_t *p_data, uint8_t data_size)
 {
-    if (desc == NULL || length == 0 || layouts == NULL || max_layouts == 0)
-        return 0;
+  uint16_t usage, usage_page;
 
-    // Reuse logic: build tmp per-report layouts similar to single-layout parser
-    hid_report_layout_t tmp_layouts[256];
-    uint8_t report_used[256] = {0};
-    uint32_t report_bits[256];
-    for (int i = 0; i < 256; i++)
+  switch (item)
+  {
+  case ITEM_USAGE:
+    if (!usage_data(p_data, data_size, &usage, &usage_page))
     {
-        memset(&tmp_layouts[i], 0, sizeof(hid_report_layout_t));
-        report_bits[i] = 0;
+      return -1;
+    }
+    if (!add_usage_range(state, usage, usage, usage_page))
+    {
+      return -1; // Too many usages
+    }
+    return 0;
+
+  case ITEM_USAGE_MIN:
+    if (!usage_data(p_data, data_size, &usage, &usage_page))
+    {
+      return -1;
     }
 
-    size_t offset = 0;
-    uint32_t usage_page = 0;
-    uint32_t report_size = 0, report_count = 0;
-    uint8_t current_report_id = 0;
-    uint32_t last_usage = 0;
-    uint32_t usage_min = 0, usage_max = 0;
-    bool have_usage_min_max = false;
-
-    while (offset < length)
+    switch (state->flags & (FLAG_USAGE_MIN | FLAG_USAGE_MAX))
     {
-        uint8_t item = desc[offset];
-        uint8_t item_type = (item >> 2) & 0x03;
-        uint8_t item_tag = (item >> 4) & 0x0F;
-        uint8_t item_size = item & 0x03;
-        size_t payload_bytes = (item_size == 3) ? 4 : item_size;
-        if (offset + payload_bytes >= length)
-            break;
-        uint32_t item_value = 0;
-        for (size_t i = 0; i < payload_bytes; i++)
-            item_value |= ((uint32_t)desc[offset + 1 + i]) << (8 * i);
+    case FLAG_USAGE_MIN:
+      // Overwriting the previous USAGE_MIN that wasn't closed with a USAGE_MAX
+      {
+        usage_range_t *r = &state->usage_ranges[state->num_usage_ranges - 1];
+        r->usage_min = usage;
+        r->usage_page = usage_page;
+      }
+      break;
 
-        if (item_type == 1)
-        {
-            switch (item_tag)
-            {
-            case 0x00:
-                usage_page = item_value;
-                break;
-            case 0x07:
-                report_size = item_value;
-                break;
-            case 0x08:
-                report_count = item_value;
-                break;
-            case 0x09:
-                current_report_id = (uint8_t)item_value;
-                if (!report_used[current_report_id])
-                {
-                    report_used[current_report_id] = 1;
-                    report_bits[current_report_id] = current_report_id ? 8 : 0;
-                    tmp_layouts[current_report_id].report_id = current_report_id;
-                }
-                break;
-            default:
-                break;
-            }
-        }
-        else if (item_type == 2)
-        {
-            switch (item_tag)
-            {
-            case 0x00:
-                last_usage = item_value;
-                have_usage_min_max = false;
-                break;
-            case 0x01:
-                usage_min = item_value;
-                have_usage_min_max = true;
-                break;
-            case 0x02:
-                usage_max = item_value;
-                have_usage_min_max = true;
-                break;
-            default:
-                break;
-            }
-        }
-        else if (item_type == 0)
-        {
-            if (item_tag == 0x08)
-            {
-                // Input
-                if ((item_value & 0x01) == 0)
-                {
-                    if (report_used[current_report_id])
-                        report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
-                }
-                else
-                {
-                    if (!report_used[current_report_id])
-                    {
-                        report_used[current_report_id] = 1;
-                        report_bits[current_report_id] = current_report_id ? 8 : 0;
-                        tmp_layouts[current_report_id].report_id = current_report_id;
-                    }
-                    uint32_t base_bit = report_bits[current_report_id];
-                    if (usage_page == 0x09)
-                    {
-                        if (tmp_layouts[current_report_id].buttons_count == 0)
-                        {
-                            tmp_layouts[current_report_id].buttons_bit_offset = base_bit;
-                            tmp_layouts[current_report_id].buttons_count = (uint16_t)report_count;
-                        }
-                    }
-                    else if (usage_page == 0x01)
-                    {
-                        if (have_usage_min_max)
-                        {
-                            for (uint32_t u = usage_min; u <= usage_max; u++)
-                            {
-                                if (u == 0x30 && tmp_layouts[current_report_id].x_size == 0)
-                                {
-                                    tmp_layouts[current_report_id].x_bit_offset = base_bit + (u - usage_min) * report_size;
-                                    tmp_layouts[current_report_id].x_size = report_size;
-                                }
-                                else if (u == 0x31 && tmp_layouts[current_report_id].y_size == 0)
-                                {
-                                    tmp_layouts[current_report_id].y_bit_offset = base_bit + (u - usage_min) * report_size;
-                                    tmp_layouts[current_report_id].y_size = report_size;
-                                }
-                                else if (u == 0x38 && tmp_layouts[current_report_id].wheel_size == 0)
-                                {
-                                    tmp_layouts[current_report_id].wheel_bit_offset = base_bit + (u - usage_min) * report_size;
-                                    tmp_layouts[current_report_id].wheel_size = report_size;
-                                }
-                            }
-                        }
-                        else if (last_usage)
-                        {
-                            uint32_t u = last_usage;
-                            if (u == 0x30 && tmp_layouts[current_report_id].x_size == 0)
-                            {
-                                tmp_layouts[current_report_id].x_bit_offset = base_bit;
-                                tmp_layouts[current_report_id].x_size = report_size;
-                            }
-                            else if (u == 0x31 && tmp_layouts[current_report_id].y_size == 0)
-                            {
-                                tmp_layouts[current_report_id].y_bit_offset = base_bit;
-                                tmp_layouts[current_report_id].y_size = report_size;
-                            }
-                            else if (u == 0x38 && tmp_layouts[current_report_id].wheel_size == 0)
-                            {
-                                tmp_layouts[current_report_id].wheel_bit_offset = base_bit;
-                                tmp_layouts[current_report_id].wheel_size = report_size;
-                            }
-                        }
-                    }
-                    report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
-                    last_usage = 0;
-                    have_usage_min_max = false;
-                }
-            }
-        }
+    case FLAG_USAGE_MAX:
+    {
+      usage_range_t *r = &state->usage_ranges[state->num_usage_ranges - 1];
+      uint16_t r_page = r->usage_page;
+      if (r_page == 0)
+        r_page = state->usage_page;
+      uint16_t new_page = usage_page;
+      if (new_page == 0)
+        new_page = state->usage_page;
+      if (r_page != new_page)
+      {
+        return -1; // Page mismatch
+      }
+      if (usage > r->usage_max)
+      {
+        return -1; // Invalid range
+      }
+      r->usage_min = usage;
+      state->flags &= ~FLAG_USAGE_MAX;
+    }
+    break;
 
-        offset += 1 + payload_bytes;
+    case 0:
+      if (!add_usage_range(state, usage, usage, usage_page))
+      {
+        return -1;
+      }
+      state->flags |= FLAG_USAGE_MIN;
+      break;
+    }
+    return 0;
+
+  case ITEM_USAGE_MAX:
+    if (!usage_data(p_data, data_size, &usage, &usage_page))
+    {
+      return -1;
     }
 
-    // collect into output array
-    size_t out_count = 0;
-    for (int rid = 0; rid < 256 && out_count < (int)max_layouts; rid++)
+    switch (state->flags & (FLAG_USAGE_MIN | FLAG_USAGE_MAX))
     {
-        if (report_used[rid])
-        {
-            tmp_layouts[rid].report_size_bits = report_bits[rid];
-            layouts[out_count++] = tmp_layouts[rid];
-        }
+    case FLAG_USAGE_MAX:
+      // Overwriting the previous USAGE_MAX that wasn't closed with a USAGE_MIN
+      {
+        usage_range_t *r = &state->usage_ranges[state->num_usage_ranges - 1];
+        r->usage_max = usage;
+        r->usage_page = usage_page;
+      }
+      break;
+
+    case FLAG_USAGE_MIN:
+    {
+      usage_range_t *r = &state->usage_ranges[state->num_usage_ranges - 1];
+      uint16_t r_page = r->usage_page;
+      if (r_page == 0)
+        r_page = state->usage_page;
+      uint16_t new_page = usage_page;
+      if (new_page == 0)
+        new_page = state->usage_page;
+      if (r_page != new_page)
+      {
+        return -1; // Page mismatch
+      }
+      if (usage < r->usage_min)
+      {
+        return -1; // Invalid range
+      }
+      r->usage_max = usage;
+      state->flags &= ~FLAG_USAGE_MIN;
+    }
+    break;
+
+    case 0:
+      if (!add_usage_range(state, usage, usage, usage_page))
+      {
+        return -1;
+      }
+      state->flags |= FLAG_USAGE_MAX;
+      break;
+    }
+    return 0;
+
+  default:
+    return 0;
+  }
+}
+
+// Structure to track layouts per report ID
+typedef struct
+{
+  uint8_t report_id;
+  hid_report_layout_t layout;
+  bool valid;
+} layout_tracker_t;
+
+static int find_or_create_layout(layout_tracker_t *trackers, int *count, int max_count, uint8_t report_id)
+{
+  // Find existing layout for this report ID
+  for (int i = 0; i < *count; i++)
+  {
+    if (trackers[i].report_id == report_id)
+    {
+      return i;
+    }
+  }
+
+  // Create new layout
+  if (*count >= max_count)
+  {
+    return -1;
+  }
+
+  int idx = (*count)++;
+  trackers[idx].report_id = report_id;
+  memset(&trackers[idx].layout, 0, sizeof(hid_report_layout_t));
+  trackers[idx].layout.report_id = report_id;
+  trackers[idx].valid = false;
+  return idx;
+}
+
+int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descriptor_size,
+                                        hid_report_layout_t *layouts, int max_layouts)
+{
+  if (!descriptor || !layouts || max_layouts <= 0)
+  {
+    return 0;
+  }
+
+  // Initialize layouts
+  for (int i = 0; i < max_layouts; i++)
+  {
+    memset(&layouts[i], 0, sizeof(hid_report_layout_t));
+  }
+
+  parser_state_t state;
+  layout_tracker_t trackers[16];
+  int tracker_count = 0;
+  int current_tracker_idx = -1;
+
+  reset_parser(&state);
+
+  const uint8_t *p = (const uint8_t *)descriptor;
+  const uint8_t *q = p + descriptor_size;
+
+  // Start with report ID 0 (no report ID)
+  current_tracker_idx = find_or_create_layout(trackers, &tracker_count, max_layouts, 0);
+  if (current_tracker_idx >= 0)
+  {
+    state.current_layout = &trackers[current_tracker_idx].layout;
+    state.current_layout->report_id = 0;
+  }
+
+  while (p < q)
+  {
+    uint8_t b = *p++;
+    size_t bytes_left = q - p;
+
+    if (b == ITEM_LONG)
+    {
+      if (bytes_left < 1)
+        break;
+      p += 2 + (size_t)*p;
+      continue;
     }
 
-    return (int)out_count;
+    uint8_t data_size = b & ITEM_SIZE_MASK;
+    if (data_size == 3)
+      data_size = 4;
+    if (bytes_left < data_size)
+      break;
+
+    uint8_t item = b & ITEM_TAG_AND_TYPE_MASK;
+
+    // Process the item first (to update state)
+    int res = 0;
+    switch (b & ITEM_TYPE_MASK)
+    {
+    case ITEM_TYPE_MAIN:
+      res = parse_main_item(&state, item, p, data_size);
+      break;
+
+    case ITEM_TYPE_GLOBAL:
+      res = parse_global_item(&state, item, p, data_size);
+      // Handle REPORT_ID global item - switch to new layout tracker AFTER processing
+      if (item == ITEM_REPORT_ID && state.report_id != 0)
+      {
+        // Save current layout state
+        if (current_tracker_idx >= 0 && state.current_layout)
+        {
+          bool has_fields = (state.current_layout->buttons_count > 0 ||
+                             state.current_layout->x_size > 0 ||
+                             state.current_layout->y_size > 0 ||
+                             state.current_layout->wheel_size > 0 ||
+                             state.current_layout->pan_size > 0);
+
+          if (state.layout_valid || has_fields)
+          {
+            trackers[current_tracker_idx].layout = *state.current_layout;
+            trackers[current_tracker_idx].layout.report_size_bits = state.current_bit_offset;
+            trackers[current_tracker_idx].valid = true;
+          }
+        }
+
+        // Switch to new report ID layout
+        int idx = find_or_create_layout(trackers, &tracker_count, max_layouts, state.report_id);
+        if (idx >= 0)
+        {
+          current_tracker_idx = idx;
+          state.current_layout = &trackers[idx].layout;
+          state.current_layout->report_id = state.report_id;
+          // Reset parser state for new report (except globals that persist)
+          state.current_bit_offset = 0;
+          state.first_field_processed = false;
+          state.first_field_has_report_id = false;
+          state.layout_valid = false;
+          reset_locals(&state);
+        }
+      }
+      break;
+
+    case ITEM_TYPE_LOCAL:
+      res = parse_local_item(&state, item, p, data_size);
+      break;
+
+    default:
+      break;
+    }
+
+    if (res != 0)
+      break;
+    p += data_size;
+  }
+
+  // Save final layout state
+  if (current_tracker_idx >= 0 && state.current_layout)
+  {
+    bool has_fields = (state.current_layout->buttons_count > 0 ||
+                       state.current_layout->x_size > 0 ||
+                       state.current_layout->y_size > 0 ||
+                       state.current_layout->wheel_size > 0 ||
+                       state.current_layout->pan_size > 0);
+
+    if (state.layout_valid || has_fields)
+    {
+      trackers[current_tracker_idx].layout = *state.current_layout;
+      trackers[current_tracker_idx].layout.report_size_bits = state.current_bit_offset;
+      trackers[current_tracker_idx].valid = true;
+    }
+  }
+
+  // Copy valid layouts to output array
+  int layout_count = 0;
+  for (int i = 0; i < tracker_count && layout_count < max_layouts; i++)
+  {
+    bool has_fields = (trackers[i].layout.buttons_count > 0 ||
+                       trackers[i].layout.x_size > 0 ||
+                       trackers[i].layout.y_size > 0 ||
+                       trackers[i].layout.wheel_size > 0 ||
+                       trackers[i].layout.pan_size > 0);
+
+    if (trackers[i].valid || has_fields)
+    {
+      layouts[layout_count] = trackers[i].layout;
+      layout_count++;
+    }
+  }
+
+  return layout_count;
+}
+
+int parse_hid_report_descriptor_layout(const void *descriptor, size_t descriptor_size,
+                                       hid_report_layout_t *layout)
+{
+  if (!descriptor || !layout)
+  {
+    return -1;
+  }
+
+  parser_state_t state;
+  reset_parser(&state);
+  state.current_layout = layout;
+  layout->report_id = 0;
+
+  const uint8_t *p = (const uint8_t *)descriptor;
+  const uint8_t *q = p + descriptor_size;
+
+  while (p < q)
+  {
+    uint8_t b = *p++;
+    size_t bytes_left = q - p;
+
+    if (b == ITEM_LONG)
+    {
+      if (bytes_left < 1)
+        break;
+      p += 2 + (size_t)*p;
+      continue;
+    }
+
+    uint8_t data_size = b & ITEM_SIZE_MASK;
+    if (data_size == 3)
+      data_size = 4;
+    if (bytes_left < data_size)
+      break;
+
+    uint8_t item = b & ITEM_TAG_AND_TYPE_MASK;
+    int res = 0;
+
+    switch (b & ITEM_TYPE_MASK)
+    {
+    case ITEM_TYPE_MAIN:
+      res = parse_main_item(&state, item, p, data_size);
+      break;
+
+    case ITEM_TYPE_GLOBAL:
+      res = parse_global_item(&state, item, p, data_size);
+      break;
+
+    case ITEM_TYPE_LOCAL:
+      res = parse_local_item(&state, item, p, data_size);
+      break;
+
+    default:
+      break;
+    }
+
+    if (res != 0)
+      break;
+    p += data_size;
+  }
+
+  if (state.layout_valid)
+  {
+    layout->report_size_bits = state.current_bit_offset;
+    return 0;
+  }
+
+  return -1;
 }

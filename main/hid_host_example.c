@@ -35,9 +35,9 @@
 #include "nvs_flash.h"
 
 #include "hid_dev.h"
+#include "hid_report_parser_c.h"
 
 #include "led_strip.h"
-#include "hid_report_parser.h"
 
 /* =================================================================================================
    MACROS
@@ -446,7 +446,7 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
     wheel = 0; // Boot Protocol 不支持滚轮
     ESP_LOGD(TAG_MOUSE, "Parsed as Boot Protocol (3 bytes)");
   }
-  else
+  else if (length >= 8)
   {
     // First, if we have parsed layouts, try to find one matching this packet (by Report ID or size)
     hid_report_layout_t *use_layout = NULL;
@@ -482,28 +482,112 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
 
     if (use_layout)
     {
-      uint32_t buttons_u = get_bits_u32(data, length, use_layout->buttons_bit_offset, use_layout->buttons_count);
+      // Adjust bit_offset if report_id is present (report_id takes 1 byte = 8 bits)
+      // The parser returns offsets relative to report data start (excluding report_id)
+      uint32_t bit_offset_adjust = (use_layout->report_id != 0) ? 8 : 0;
+
+      uint32_t buttons_u = get_bits_u32(data, length, use_layout->buttons_bit_offset + bit_offset_adjust, use_layout->buttons_count);
       buttons = (uint8_t)(buttons_u & 0xFF);
-      int32_t x_raw = use_layout->x_size ? get_bits_s32(data, length, use_layout->x_bit_offset, use_layout->x_size) : 0;
-      int32_t y_raw = use_layout->y_size ? get_bits_s32(data, length, use_layout->y_bit_offset, use_layout->y_size) : 0;
-      int32_t wheel_raw = use_layout->wheel_size ? get_bits_s32(data, length, use_layout->wheel_bit_offset, use_layout->wheel_size) : 0;
+      int32_t x_raw = use_layout->x_size ? get_bits_s32(data, length, use_layout->x_bit_offset + bit_offset_adjust, use_layout->x_size) : 0;
+      int32_t y_raw = use_layout->y_size ? get_bits_s32(data, length, use_layout->y_bit_offset + bit_offset_adjust, use_layout->y_size) : 0;
+      int32_t wheel_raw = use_layout->wheel_size ? get_bits_s32(data, length, use_layout->wheel_bit_offset + bit_offset_adjust, use_layout->wheel_size) : 0;
 
-      if (x_raw > 127)
-        x = 127;
-      else if (x_raw < -127)
-        x = -127;
+      // Clamp values based on the actual bit size
+      // For 8-bit: -128 to 127
+      // For 16-bit: -32768 to 32767
+      // For other sizes: use appropriate range
+      if (use_layout->x_size == 8)
+      {
+        if (x_raw > 127)
+          x = 127;
+        else if (x_raw < -128)
+          x = -128;
+        else
+          x = (int8_t)x_raw;
+      }
+      else if (use_layout->x_size == 16)
+      {
+        // For 16-bit values, clamp directly to int8_t range
+        // Don't divide by 256 as it would make all small values become 0
+        if (x_raw > 127)
+          x = 127;
+        else if (x_raw < -128)
+          x = -128;
+        else
+          x = (int8_t)x_raw;
+      }
       else
-        x = (int8_t)x_raw;
-      if (y_raw > 127)
-        y = 127;
-      else if (y_raw < -127)
-        y = -127;
+      {
+        // For other sizes, clamp to int8_t range
+        if (x_raw > 127)
+          x = 127;
+        else if (x_raw < -128)
+          x = -128;
+        else
+          x = (int8_t)x_raw;
+      }
+
+      if (use_layout->y_size == 8)
+      {
+        if (y_raw > 127)
+          y = 127;
+        else if (y_raw < -128)
+          y = -128;
+        else
+          y = (int8_t)y_raw;
+      }
+      else if (use_layout->y_size == 16)
+      {
+        // For 16-bit values, clamp directly to int8_t range
+        // Don't divide by 256 as it would make all small values become 0
+        if (y_raw > 127)
+          y = 127;
+        else if (y_raw < -128)
+          y = -128;
+        else
+          y = (int8_t)y_raw;
+      }
       else
-        y = (int8_t)y_raw;
+      {
+        // For other sizes, clamp to int8_t range
+        if (y_raw > 127)
+          y = 127;
+        else if (y_raw < -128)
+          y = -128;
+        else
+          y = (int8_t)y_raw;
+      }
+
       wheel = use_layout->wheel_size ? (int8_t)wheel_raw : 0;
+      int32_t pan_raw = use_layout->pan_size ? get_bits_s32(data, length, use_layout->pan_bit_offset + bit_offset_adjust, use_layout->pan_size) : 0;
+      int8_t pan = use_layout->pan_size ? (int8_t)pan_raw : 0;
 
-      ESP_LOGI(TAG_MOUSE, "Parsed by layout (rid=%u): buttons_raw=0x%X, x_raw=%d->%d, y_raw=%d->%d, wheel=%d",
-               (unsigned int)use_layout->report_id, (unsigned int)buttons_u, (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel);
+      // Debug: print raw header bytes and where each field is located (bit offsets -> byte indexes)
+      {
+        int max_print = (length < 16) ? length : 16;
+        char buf[128] = {0};
+        int pos = 0;
+        for (int i = 0; i < max_print; i++)
+        {
+          pos += snprintf(&buf[pos], sizeof(buf) - pos, "%02X ", data[i]);
+        }
+        ESP_LOGD(TAG_MOUSE, "Raw report bytes (first %d): %s", max_print, buf);
+        uint32_t btn_byte = use_layout->buttons_bit_offset / 8;
+        uint32_t x_byte = use_layout->x_bit_offset / 8;
+        uint32_t y_byte = use_layout->y_bit_offset / 8;
+        uint32_t wheel_byte = use_layout->wheel_bit_offset / 8;
+        uint32_t pan_byte = use_layout->pan_bit_offset / 8;
+        ESP_LOGI(TAG_MOUSE, "Parsed by layout (rid=%u): report_bits=%u, buttons_bit=%u (byte %u), x_bit=%u (byte %u) size=%u, y_bit=%u (byte %u) size=%u, wheel_bit=%u (byte %u) size=%u, pan_bit=%u (byte %u) size=%u",
+                 (unsigned int)use_layout->report_id,
+                 (unsigned int)use_layout->report_size_bits,
+                 (unsigned int)use_layout->buttons_bit_offset, (unsigned int)btn_byte,
+                 (unsigned int)use_layout->x_bit_offset, (unsigned int)x_byte, (unsigned int)use_layout->x_size,
+                 (unsigned int)use_layout->y_bit_offset, (unsigned int)y_byte, (unsigned int)use_layout->y_size,
+                 (unsigned int)use_layout->wheel_bit_offset, (unsigned int)wheel_byte, (unsigned int)use_layout->wheel_size,
+                 (unsigned int)use_layout->pan_bit_offset, (unsigned int)pan_byte, (unsigned int)use_layout->pan_size);
+        ESP_LOGI(TAG_MOUSE, "fields: buttons_raw=0x%X, x_raw=%d->%d, y_raw=%d->%d, wheel=%d, pan=%d",
+                 (unsigned int)buttons_u, (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel, (int)pan);
+      }
     }
     else
     {
@@ -545,9 +629,12 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
         wheel = (int8_t)B6;
         int8_t pan = (int8_t)B7;
 
+        // Debug: print original header bytes and how 12-bit X/Y are assembled
+        ESP_LOGD(TAG_MOUSE, "Header bytes: %02X %02X %02X %02X %02X %02X %02X", data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
         ESP_LOGI(TAG_MOUSE,
-                 "Report ID 0x02: buttons=0x%04X, x_12=%d->%d, y_12=%d->%d, wheel=%d, pan=%d",
-                 buttons16, x_12bit, x, y_12bit, y, wheel, pan);
+                 "Report ID 0x02: buttons=0x%04X, x_12=%d (raw=0x%03X)->%d, y_12=%d (raw=0x%03X)->%d, wheel=%d, pan=%d",
+                 buttons16, x_12bit, (unsigned int)x_raw, x, y_12bit, (unsigned int)y_raw, y, wheel, pan);
+        ESP_LOGI(TAG_MOUSE, "Detailed bits: B3=0x%02X, B4=0x%02X, B5=0x%02X -> x_raw=(B3|((B4&0x0F)<<8)), y_raw=((B4>>4)|B5<<4)", B3, B4, B5);
       }
       else if (data[0] > 0 && data[0] <= 0x0F)
       {
@@ -872,8 +959,6 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
         }
         ESP_LOGI(TAG_MOUSE, "=========================================");
 
-        // 解析并打印可读格式
-        parse_hid_report_descriptor(report_desc, report_desc_len);
         // 解析并生成简单的report layout以便后续自动解析数据
         g_mouse_layout_count = parse_hid_report_descriptor_layouts(report_desc, report_desc_len, g_mouse_layouts, MAX_MOUSE_LAYOUTS);
         if (g_mouse_layout_count > 0)
@@ -881,19 +966,48 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
           for (int i = 0; i < g_mouse_layout_count; i++)
           {
             hid_report_layout_t *l = &g_mouse_layouts[i];
-            ESP_LOGI(TAG_MOUSE, "Parsed mouse layout[%d]: report_id=%u, buttons=%u, buttons_bit_offset=%u, x: bit=%u size=%u, y: bit=%u size=%u, wheel: bit=%u size=%u",
+            ESP_LOGI(TAG_MOUSE, "Parsed mouse layout[%d]: report_id=%u, buttons=%u, buttons_bit_offset=%u, x: bit=%u size=%u, y: bit=%u size=%u, wheel: bit=%u size=%u, pan: bit=%u size=%u",
                      i,
                      (unsigned int)l->report_id,
                      (unsigned int)l->buttons_count,
                      (unsigned int)l->buttons_bit_offset,
                      (unsigned int)l->x_bit_offset, (unsigned int)l->x_size,
                      (unsigned int)l->y_bit_offset, (unsigned int)l->y_size,
-                     (unsigned int)l->wheel_bit_offset, (unsigned int)l->wheel_size);
+                     (unsigned int)l->wheel_bit_offset, (unsigned int)l->wheel_size,
+                     (unsigned int)l->pan_bit_offset, (unsigned int)l->pan_size);
           }
         }
         else
         {
           ESP_LOGW(TAG_MOUSE, "未能解析到鼠标布局，仍将使用默认/兼容解析逻辑");
+        }
+        // Also run single-layout parser to show what the simpler heuristic returns
+        {
+          hid_report_layout_t single_layout = {0};
+          int r = parse_hid_report_descriptor_layout(report_desc, report_desc_len, &single_layout);
+          if (r == 0)
+          {
+            ESP_LOGI(TAG_MOUSE, "parse_hid_report_descriptor_layout -> SUCCESS: report_id=%u, buttons=%u, buttons_bit_offset=%u, x: bit=%u size=%u, y: bit=%u size=%u, wheel: bit=%u size=%u, pan: bit=%u size=%u, report_size_bits=%u",
+                     (unsigned int)single_layout.report_id,
+                     (unsigned int)single_layout.buttons_count,
+                     (unsigned int)single_layout.buttons_bit_offset,
+                     (unsigned int)single_layout.x_bit_offset, (unsigned int)single_layout.x_size,
+                     (unsigned int)single_layout.y_bit_offset, (unsigned int)single_layout.y_size,
+                     (unsigned int)single_layout.wheel_bit_offset, (unsigned int)single_layout.wheel_size,
+                     (unsigned int)single_layout.pan_bit_offset, (unsigned int)single_layout.pan_size,
+                     (unsigned int)single_layout.report_size_bits);
+          }
+          else
+          {
+            ESP_LOGW(TAG_MOUSE, "parse_hid_report_descriptor_layout -> no suitable mouse-like report found, first fallback layout: report_id=%u, buttons=%u, x_size=%u, y_size=%u, wheel_size=%u, pan_size=%u, report_size_bits=%u",
+                     (unsigned int)single_layout.report_id,
+                     (unsigned int)single_layout.buttons_count,
+                     (unsigned int)single_layout.x_size,
+                     (unsigned int)single_layout.y_size,
+                     (unsigned int)single_layout.wheel_size,
+                     (unsigned int)single_layout.pan_size,
+                     (unsigned int)single_layout.report_size_bits);
+          }
         }
       }
       else

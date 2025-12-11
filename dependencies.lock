@@ -1,6 +1,7 @@
 dependencies:
   espressif/led_strip:
-    component_hash: f907c58f722c58ab8545366668cfd8769cefb7d97a631a14e9d16234cc72bdff
+    component_hash: 
+      f907c58f722c58ab8545366668cfd8769cefb7d97a631a14e9d16234cc72bdff
     dependencies:
     - name: idf
       require: private
@@ -10,7 +11,8 @@ dependencies:
       type: service
     version: 3.0.0
   espressif/usb_host_hid:
-    component_hash: eabf03fe3cb1bdb5325d2725f420c6324c3e150033d893ce3737222929455a55
+    component_hash: 
+      eabf03fe3cb1bdb5325d2725f420c6324c3e150033d893ce3737222929455a55
     dependencies:
     - name: idf
       require: private
