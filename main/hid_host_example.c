@@ -37,6 +37,7 @@
 #include "hid_dev.h"
 
 #include "led_strip.h"
+#include "hid_report_parser.h"
 
 /* =================================================================================================
    MACROS
@@ -405,22 +406,70 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   }
   else if (length == 8)
   {
-    // 8字节Report Protocol格式（macOS常见）
-    // 根据实际测试数据，macOS发送的8字节报告格式为：
-    // Report ID(1) + 按钮(1) + 保留/填充(1) + Y(1) + X(1) + Wheel(1) + 其他(2)
-    // 即：data[0]=Report ID, data[1]=按钮, data[2]=保留, data[3]=Y, data[4]=X, data[5]=Wheel
+    // 8字节Report Protocol格式（根据HID Report Descriptor解析结果）
+    // Report ID 0x02: 按钮(16位=2字节) + X(12位) + Y(12位) + Wheel(8位) + AC Pan(8位)
+    // HID报告按位打包：data[0]=Report ID, data[1:2]=按钮(16位),
+    // data[2:3]=X(12位有符号), data[3:4]=Y(12位有符号), data[5]=Wheel, data[6]=AC Pan
 
-    // 检查第一个字节是否是Report ID（通常是0x02）
-    if (data[0] == 0x02 || (data[0] > 0 && data[0] <= 0x0F))
+    // 检查是否是Report ID 0x02（鼠标主报告）
+    if (data[0] == 0x02)
     {
-      // macOS 8字节格式：Report ID + 按钮 + 保留 + Y + X + Wheel + 其他
-      data_offset = 1;
+      uint8_t B1 = data[1];
+      uint8_t B2 = data[2];
+      uint8_t B3 = data[3];
+      uint8_t B4 = data[4];
+      uint8_t B5 = data[5];
+      uint8_t B6 = data[6];
+      uint8_t B7 = data[7];
+
+      // 16 个按钮 bit
+      uint16_t buttons16 = (uint16_t)B1 | ((uint16_t)B2 << 8);
+      buttons = (uint8_t)(buttons16 & 0xFF); // 如果你只关心前8个按钮
+
+      // X: 12-bit 有符号，bits: B3[7:0] + B4[3:0]
+      uint16_t x_raw = (uint16_t)B3 | ((uint16_t)(B4 & 0x0F) << 8);
+      int16_t x_12bit = (x_raw & 0x0800) ? (int16_t)(x_raw | 0xF000)
+                                         : (int16_t)x_raw;
+
+      // Y: 12-bit 有符号，bits: B4[7:4] + B5[7:0]
+      uint16_t y_raw = (uint16_t)(B4 >> 4) | ((uint16_t)B5 << 4);
+      int16_t y_12bit = (y_raw & 0x0800) ? (int16_t)(y_raw | 0xF000)
+                                         : (int16_t)y_raw;
+
+      // 映射到 -127~127（给 BLE 8bit 用）
+      if (x_12bit > 127)
+        x = 127;
+      else if (x_12bit < -127)
+        x = -127;
+      else
+        x = (int8_t)x_12bit;
+
+      if (y_12bit > 127)
+        y = 127;
+      else if (y_12bit < -127)
+        y = -127;
+      else
+        y = (int8_t)y_12bit;
+
+      // Wheel / Pan
+      wheel = (int8_t)B6;
+      int8_t pan = (int8_t)B7;
+
+      ESP_LOGI(TAG_MOUSE,
+               "Report ID 0x02: buttons=0x%04X, x_12=%d->%d, y_12=%d->%d, wheel=%d, pan=%d",
+               buttons16, x_12bit, x, y_12bit, y, wheel, pan);
+    }
+    // 检查是否是其他Report ID（0x01或其他）
+    else if (data[0] > 0 && data[0] <= 0x0F)
+    {
+      // 其他Report ID，暂时使用标准格式解析
+      // 注意：这里可能需要根据实际的Report ID进行不同的解析
+      ESP_LOGW(TAG_MOUSE, "Unhandled Report ID: 0x%02X, using default parsing", data[0]);
       buttons = data[1];
-      // data[2] 通常是0x00（保留/填充字段）
-      y = (int8_t)data[4];     // Y在data[3]
-      x = (int8_t)data[3];     // X在data[4]（之前错误地解析为data[2]）
-      wheel = (int8_t)data[6]; // Wheel在data[5]（之前错误地解析为data[4]）
-      ESP_LOGI(TAG_MOUSE, "8-byte format (macOS): ID=0x%02X, buttons=0x%02X, x=%d, y=%d, wheel=%d",
+      x = (int8_t)data[2];
+      y = (int8_t)data[3];
+      wheel = (int8_t)data[4];
+      ESP_LOGI(TAG_MOUSE, "Other Report ID (0x%02X): buttons=0x%02X, x=%d, y=%d, wheel=%d",
                data[0], buttons, x, y, wheel);
     }
     else
@@ -708,6 +757,39 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
       // 保存鼠标设备句柄
       usb_hid_devices.mouse_handle = hid_device_handle;
       ESP_LOGI(TAG_MOUSE, "鼠标设备已注册");
+
+      // 获取并打印鼠标的 HID Report Descriptor
+      size_t report_desc_len = 0;
+      const uint8_t *report_desc = hid_host_get_report_descriptor(hid_device_handle, &report_desc_len);
+
+      if (report_desc != NULL && report_desc_len > 0)
+      {
+        ESP_LOGI(TAG_MOUSE, "=========================================");
+        ESP_LOGI(TAG_MOUSE, "鼠标 HID Report Descriptor (长度: %zu 字节):", report_desc_len);
+        ESP_LOGI(TAG_MOUSE, "=========================================");
+        // 打印原始十六进制数据
+        for (size_t i = 0; i < report_desc_len; i++)
+        {
+          printf("%02X ", report_desc[i]);
+          // 每16字节换行，便于阅读
+          if ((i + 1) % 16 == 0)
+          {
+            putchar('\n');
+          }
+        }
+        if (report_desc_len % 16 != 0)
+        {
+          putchar('\n');
+        }
+        ESP_LOGI(TAG_MOUSE, "=========================================");
+
+        // 解析并打印可读格式
+        parse_hid_report_descriptor(report_desc, report_desc_len);
+      }
+      else
+      {
+        ESP_LOGW(TAG_MOUSE, "无法获取 HID Report Descriptor (长度: %zu)", report_desc_len);
+      }
     }
 
     ESP_ERROR_CHECK(hid_host_device_start(hid_device_handle));

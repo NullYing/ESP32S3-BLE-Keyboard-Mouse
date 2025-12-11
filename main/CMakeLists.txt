@@ -4,6 +4,7 @@ idf_component_register(
   "esp_hidd_prf_api.c"
   "hid_dev.c"
   "hid_device_le_prf.c"
+  "hid_report_parser.c"
   INCLUDE_DIRS
   "."
   PRIV_REQUIRES
