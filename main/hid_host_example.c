@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -55,7 +56,6 @@
 // BLE HID
 static uint16_t ble_hid_conn_id = 0;
 static bool sec_conn = false;
-static bool send_volum_up = false;
 
 static const char *TAG_BLE = "BLE";
 
@@ -111,6 +111,7 @@ static esp_ble_adv_params_t ble_hid_adv_params = {
 static const char *TAG_HID = "HID";
 static const char *TAG_KEYBOARD = "HID Keyboard";
 static const char *TAG_GENERIC = "HID Generic";
+static const char *TAG_USB = "USB";
 
 QueueHandle_t app_event_queue = NULL;
 
@@ -183,6 +184,7 @@ static void usb_lib_task(void *arg);
 void usb_hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
                                   const hid_host_driver_event_t event,
                                   void *arg);
+static void print_usb_device_info(hid_host_device_handle_t hid_device_handle);
 
 // LED
 led_strip_handle_t configure_led(void);
@@ -419,8 +421,12 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
 
     break;
   case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
-    ESP_LOGI(TAG_HID, "HID Device, interface %d protocol '%s' DISCONNECTED",
-             dev_params.iface_num, hid_proto_name_str[dev_params.proto]);
+    ESP_LOGI(TAG_USB, "=========================================");
+    ESP_LOGI(TAG_USB, "USB HID接口已断开");
+    ESP_LOGI(TAG_USB, "  设备地址: %d", dev_params.addr);
+    ESP_LOGI(TAG_USB, "  接口号: %d", dev_params.iface_num);
+    ESP_LOGI(TAG_USB, "  协议: %s", hid_proto_name_str[dev_params.proto]);
+    ESP_LOGI(TAG_USB, "=========================================");
     ESP_ERROR_CHECK(hid_host_device_close(hid_device_handle));
     evt_queue.hid_host_device.handle = NULL;
     set_led_color();
@@ -434,6 +440,30 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
              dev_params.iface_num, hid_proto_name_str[dev_params.proto]);
     break;
   }
+}
+
+/**
+ * @brief Print USB device information
+ *
+ * @param[in] hid_device_handle  HID Device handle
+ */
+static void print_usb_device_info(hid_host_device_handle_t hid_device_handle)
+{
+  hid_host_dev_params_t dev_params;
+  esp_err_t ret = hid_host_device_get_params(hid_device_handle, &dev_params);
+  if (ret != ESP_OK)
+  {
+    ESP_LOGE(TAG_USB, "Failed to get device params: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  ESP_LOGI(TAG_USB, "=========================================");
+  ESP_LOGI(TAG_USB, "USB设备已连接");
+  ESP_LOGI(TAG_USB, "  设备地址: %d", dev_params.addr);
+  ESP_LOGI(TAG_USB, "  接口号: %d", dev_params.iface_num);
+  ESP_LOGI(TAG_USB, "  HID子类: 0x%02X", dev_params.sub_class);
+  ESP_LOGI(TAG_USB, "  HID协议: %d (%s)", dev_params.proto, hid_proto_name_str[dev_params.proto]);
+  ESP_LOGI(TAG_USB, "=========================================");
 }
 
 /**
@@ -453,7 +483,8 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
   switch (event)
   {
   case HID_HOST_DRIVER_EVENT_CONNECTED:
-    ESP_LOGI(TAG_HID, "HID Device");
+    ESP_LOGI(TAG_HID, "HID Device Connected");
+    print_usb_device_info(hid_device_handle);
     printf("address: %d, interface: %d, subclass: %d, protocol: %d %s\n",
            dev_params.addr, dev_params.iface_num, dev_params.sub_class, dev_params.proto, hid_proto_name_str[dev_params.proto]);
 
@@ -492,16 +523,33 @@ static void usb_lib_task(void *arg)
   };
 
   ESP_ERROR_CHECK(usb_host_install(&host_config));
+  ESP_LOGI(TAG_USB, "USB Host库已初始化");
   xTaskNotifyGive(arg);
+
+  ESP_LOGI(TAG_USB, "USB Host事件处理循环已启动");
 
   while (true)
   {
     uint32_t event_flags;
-    usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+    esp_err_t ret = usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+    if (ret != ESP_OK)
+    {
+      ESP_LOGE(TAG_USB, "usb_host_lib_handle_events failed: %s", esp_err_to_name(ret));
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    // 打印事件标志用于调试
+    if (event_flags != 0)
+    {
+      ESP_LOGI(TAG_USB, "USB Host事件标志: 0x%08" PRIX32, event_flags);
+    }
+
     // In this example, there is only one client registered
     // So, once we deregister the client, this call must succeed with ESP_OK
     if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
     {
+      ESP_LOGI(TAG_USB, "USB Host: 没有客户端注册，准备关闭");
       ESP_ERROR_CHECK(usb_host_device_free_all());
       break;
     }
@@ -527,6 +575,8 @@ void usb_hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
                                   const hid_host_driver_event_t event,
                                   void *arg)
 {
+  ESP_LOGI(TAG_USB, "HID Host设备回调被调用，事件类型: %d", event);
+
   const app_event_queue_t evt_queue = {
       .event_group = APP_EVENT_HID_HOST,
       // HID Host Device related info
@@ -536,7 +586,19 @@ void usb_hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
 
   if (app_event_queue)
   {
-    xQueueSend(app_event_queue, &evt_queue, 0);
+    BaseType_t ret = xQueueSend(app_event_queue, &evt_queue, 0);
+    if (ret != pdTRUE)
+    {
+      ESP_LOGW(TAG_USB, "Failed to send event to queue (queue full?)");
+    }
+    else
+    {
+      ESP_LOGI(TAG_USB, "事件已加入队列");
+    }
+  }
+  else
+  {
+    ESP_LOGE(TAG_USB, "事件队列未初始化！");
   }
 }
 
@@ -698,27 +760,54 @@ void app_main(void)
       .callback = usb_hid_host_device_callback,
       .callback_arg = NULL};
 
-  ESP_ERROR_CHECK(hid_host_install(&hid_host_driver_config));
+  ret = hid_host_install(&hid_host_driver_config);
+  if (ret != ESP_OK)
+  {
+    ESP_LOGE(TAG_HID, "Failed to install HID host driver: %s", esp_err_to_name(ret));
+    return;
+  }
+  ESP_LOGI(TAG_HID, "HID Host驱动已安装");
 
   // Create queue
   app_event_queue = xQueueCreate(10, sizeof(app_event_queue_t));
+  if (app_event_queue == NULL)
+  {
+    ESP_LOGE(TAG_HID, "Failed to create event queue");
+    return;
+  }
 
-  ESP_LOGI(TAG_HID, "Waiting for HID Device to be connected");
+  ESP_LOGI(TAG_HID, "等待USB HID设备连接...");
+  ESP_LOGI(TAG_USB, "提示: 请插入USB键盘设备");
 
   led_strip = configure_led();
   set_led_color();
 
+  TickType_t last_heartbeat = xTaskGetTickCount();
+  const TickType_t heartbeat_interval = pdMS_TO_TICKS(5000); // 5秒心跳
+
   while (1)
   {
-    // Wait queue
-    if (xQueueReceive(app_event_queue, &evt_queue, portMAX_DELAY))
+    // Wait queue with timeout for heartbeat
+    TickType_t timeout = pdMS_TO_TICKS(1000); // 1秒超时
+    if (xQueueReceive(app_event_queue, &evt_queue, timeout))
     {
       if (APP_EVENT_HID_HOST == evt_queue.event_group)
       {
+        ESP_LOGI(TAG_USB, "收到HID Host事件，处理中...");
         usb_hid_host_device_event(evt_queue.hid_host_device.handle,
                                   evt_queue.hid_host_device.event,
                                   evt_queue.hid_host_device.arg);
       }
+    }
+
+    // 心跳日志，确认程序在运行
+    TickType_t now = xTaskGetTickCount();
+    if ((now - last_heartbeat) >= heartbeat_interval)
+    {
+      ESP_LOGI(TAG_USB, "系统运行中，等待USB设备... (USB HID: %s, BLE HID: %s)",
+               evt_queue.hid_host_device.handle != NULL ? "已连接" : "未连接",
+               sec_conn ? "已连接" : "未连接");
+      last_heartbeat = now;
     }
   }
 
