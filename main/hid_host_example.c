@@ -30,6 +30,7 @@
 
 #include "usb/hid_host.h"
 #include "usb/hid_usage_keyboard.h"
+#include "usb/hid_usage_mouse.h"
 
 #include "nvs_flash.h"
 
@@ -42,6 +43,7 @@
    ================================================================================================= */
 #define CHAR_DECLARATION_SIZE (sizeof(uint8_t))
 #define HID_KEYBOARD_IN_RPT_LEN 8
+#define HID_MOUSE_IN_RPT_LEN 4 // macOS兼容：按钮(1) + X(1) + Y(1) + Wheel(1) = 4字节
 #define HID_CC_IN_RPT_LEN 2
 #define BLE_HID_DEVICE_NAME "BLE HID"
 
@@ -110,6 +112,7 @@ static esp_ble_adv_params_t ble_hid_adv_params = {
 // USB HOST HID
 static const char *TAG_HID = "HID";
 static const char *TAG_KEYBOARD = "HID Keyboard";
+static const char *TAG_MOUSE = "HID Mouse";
 static const char *TAG_GENERIC = "HID Generic";
 static const char *TAG_USB = "USB";
 
@@ -153,9 +156,19 @@ typedef struct
 static const char *hid_proto_name_str[] = {
     "NONE",
     "KEYBOARD",
+    "MOUSE",
 };
 
 app_event_queue_t evt_queue;
+
+// USB HID设备管理（支持同时连接键盘和鼠标）
+typedef struct
+{
+  hid_host_device_handle_t keyboard_handle;
+  hid_host_device_handle_t mouse_handle;
+} usb_hid_devices_t;
+
+static usb_hid_devices_t usb_hid_devices = {0};
 
 // LED
 led_strip_handle_t led_strip;
@@ -173,6 +186,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 // USB HOST HID
 void printBinary(uint8_t value);
 static void hid_host_keyboard_report_callback(hid_host_device_handle_t hid_device_handle, uint8_t *data, int length);
+static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_handle, uint8_t *data, int length);
 static void hid_host_generic_report_callback(const uint8_t *const data, const int length);
 void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
                                      const hid_host_interface_event_t event,
@@ -237,9 +251,10 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
   case ESP_HIDD_EVENT_BLE_LED_REPORT_WRITE_EVT:
   {
     ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_LED_REPORT_WRITE_EVT");
-    if (evt_queue.hid_host_device.handle)
+    // 发送LED报告到键盘设备（如果已连接）
+    if (usb_hid_devices.keyboard_handle)
     {
-      ESP_ERROR_CHECK(hid_class_request_set_report(evt_queue.hid_host_device.handle, HID_REPORT_TYPE_OUTPUT, 0, param->led_write.data, param->led_write.length));
+      ESP_ERROR_CHECK(hid_class_request_set_report(usb_hid_devices.keyboard_handle, HID_REPORT_TYPE_OUTPUT, 0, param->led_write.data, param->led_write.length));
     }
     ESP_LOG_BUFFER_HEX(TAG_BLE, param->led_write.data, param->led_write.length);
     printBinary(param->led_write.data[0]);
@@ -346,6 +361,134 @@ static void hid_host_keyboard_report_callback(hid_host_device_handle_t hid_devic
 }
 
 /**
+ * @brief USB HID Host Mouse Interface report callback handler
+ *
+ * @param[in] hid_device_handle  HID Device handle
+ * @param[in] data    Pointer to input report data buffer
+ * @param[in] length  Length of input report data buffer
+ */
+static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_handle, uint8_t *data, int length)
+{
+  // USB Boot Protocol 鼠标报告格式：按钮(1字节) + X位移(1字节) + Y位移(1字节) = 3字节
+  // USB Report Protocol 鼠标报告格式：长度可变，可能包含 Report ID
+  //   常见格式1：按钮(1) + X(1) + Y(1) + 滚轮(1) = 4字节
+  //   常见格式2：Report ID(1) + 按钮(1) + X(1) + Y(1) + 滚轮(1) + 其他(3) = 8字节（macOS常见）
+  // BLE鼠标报告格式（macOS兼容）：按钮(1字节) + X位移(1字节) + Y位移(1字节) + 滚轮(1字节) = 4字节
+
+  if (length < 3)
+  {
+    ESP_LOGW(TAG_MOUSE, "Mouse report too short: %d bytes (minimum 3)", length);
+    return;
+  }
+
+  uint8_t buttons;
+  int8_t x, y, wheel = 0;
+  int data_offset = 0;
+
+  // 打印原始数据用于调试（仅8字节报告）
+  if (length == 8)
+  {
+    ESP_LOGI(TAG_MOUSE, "Raw 8-byte report: %02X %02X %02X %02X %02X %02X %02X %02X",
+             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+  }
+
+  // 根据报告长度自动判断协议类型和格式
+  if (length == sizeof(hid_mouse_input_report_boot_t))
+  {
+    // Boot Protocol 格式：3字节（按钮+X+Y）
+    hid_mouse_input_report_boot_t *mouse_report = (hid_mouse_input_report_boot_t *)data;
+    buttons = mouse_report->buttons.val;
+    x = mouse_report->x_displacement;
+    y = mouse_report->y_displacement;
+    wheel = 0; // Boot Protocol 不支持滚轮
+    ESP_LOGD(TAG_MOUSE, "Parsed as Boot Protocol (3 bytes)");
+  }
+  else if (length == 8)
+  {
+    // 8字节Report Protocol格式（macOS常见）
+    // 根据实际测试数据，macOS发送的8字节报告格式为：
+    // Report ID(1) + 按钮(1) + 保留/填充(1) + Y(1) + X(1) + Wheel(1) + 其他(2)
+    // 即：data[0]=Report ID, data[1]=按钮, data[2]=保留, data[3]=Y, data[4]=X, data[5]=Wheel
+
+    // 检查第一个字节是否是Report ID（通常是0x02）
+    if (data[0] == 0x02 || (data[0] > 0 && data[0] <= 0x0F))
+    {
+      // macOS 8字节格式：Report ID + 按钮 + 保留 + Y + X + Wheel + 其他
+      data_offset = 1;
+      buttons = data[1];
+      // data[2] 通常是0x00（保留/填充字段）
+      y = (int8_t)data[4];     // Y在data[3]
+      x = (int8_t)data[3];     // X在data[4]（之前错误地解析为data[2]）
+      wheel = (int8_t)data[6]; // Wheel在data[5]（之前错误地解析为data[4]）
+      ESP_LOGI(TAG_MOUSE, "8-byte format (macOS): ID=0x%02X, buttons=0x%02X, x=%d, y=%d, wheel=%d",
+               data[0], buttons, x, y, wheel);
+    }
+    else
+    {
+      // 没有Report ID，尝试标准格式：按钮 + X + Y + 滚轮
+      buttons = data[0];
+      x = (int8_t)data[1];
+      y = (int8_t)data[2];
+      wheel = (int8_t)data[3];
+      ESP_LOGI(TAG_MOUSE, "8-byte format (no Report ID): buttons=0x%02X, x=%d, y=%d, wheel=%d",
+               buttons, x, y, wheel);
+    }
+  }
+  else
+  {
+    // 其他长度的Report Protocol格式（4字节等）
+    // 检查第一个字节是否是 Report ID
+    if (length > 3 && data[0] > 0 && data[0] <= 0x0F)
+    {
+      // 可能包含 Report ID，跳过第一个字节
+      data_offset = 1;
+      ESP_LOGD(TAG_MOUSE, "Report Protocol with Report ID: 0x%02X", data[0]);
+    }
+    else
+    {
+      // 没有 Report ID，直接从第一个字节开始解析
+      data_offset = 0;
+      ESP_LOGD(TAG_MOUSE, "Report Protocol without Report ID");
+    }
+
+    // 解析鼠标数据
+    if (length >= (data_offset + 3))
+    {
+      buttons = data[data_offset + 0];
+      x = (int8_t)data[data_offset + 1];
+      y = (int8_t)data[data_offset + 2];
+
+      // 如果长度足够，读取滚轮数据
+      if (length >= (data_offset + 4))
+      {
+        wheel = (int8_t)data[data_offset + 3];
+      }
+    }
+    else
+    {
+      ESP_LOGW(TAG_MOUSE, "Report Protocol data too short after offset: len=%d, offset=%d", length, data_offset);
+      return;
+    }
+  }
+
+  // 构建BLE鼠标报告（4字节，macOS兼容格式）
+  uint8_t ble_mouse_report[HID_MOUSE_IN_RPT_LEN] = {0};
+  ble_mouse_report[0] = buttons; // 按钮状态
+  ble_mouse_report[1] = x;       // X位移
+  ble_mouse_report[2] = y;       // Y位移
+  ble_mouse_report[3] = wheel;   // 滚轮
+
+  // 发送到BLE HID设备
+  hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, HID_MOUSE_IN_RPT_LEN, ble_mouse_report);
+
+  // 调试输出（改为INFO级别以便观察）
+  if (buttons > 0 || x != 0 || y != 0 || wheel != 0)
+  {
+    ESP_LOGI(TAG_MOUSE, "Mouse: buttons=0x%02X, x=%d, y=%d, wheel=%d, len=%d, offset=%d", buttons, x, y, wheel, length, data_offset);
+  }
+}
+
+/**
  * @brief USB HID Host Generic Interface report callback handler
  *
  * 'generic' means anything else than mouse or keyboard
@@ -408,14 +551,52 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
                                                               64,
                                                               &data_length));
 
-    if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class && HID_PROTOCOL_KEYBOARD == dev_params.proto)
+    // 根据协议类型和报告长度自动判断协议模式
+    // Boot Protocol 鼠标：3字节（按钮+X+Y）
+    // Boot Protocol 键盘：8字节（修饰键+保留+6个按键）
+    // Report Protocol：长度可变，通常>=4字节
+
+    if (HID_PROTOCOL_KEYBOARD == dev_params.proto)
     {
-      ESP_LOGI(TAG_KEYBOARD, "Keyboard Event");
+      // 键盘：Boot Protocol 固定8字节，Report Protocol 可能不同长度
+      if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class && data_length == 8)
+      {
+        ESP_LOGI(TAG_KEYBOARD, "Keyboard Event (Boot Protocol, len=%d)", data_length);
+      }
+      else
+      {
+        ESP_LOGI(TAG_KEYBOARD, "Keyboard Event (Report Protocol, len=%d)", data_length);
+      }
       hid_host_keyboard_report_callback(hid_device_handle, data, data_length);
+    }
+    else if (HID_PROTOCOL_MOUSE == dev_params.proto)
+    {
+      // 鼠标：根据报告长度自动判断协议类型
+      // Boot Protocol: 3字节（按钮+X+Y）
+      // Report Protocol: 4字节或更多（可能包含滚轮、额外按钮等）
+      bool is_boot_protocol = (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class && data_length == 3);
+
+      if (is_boot_protocol)
+      {
+        ESP_LOGI(TAG_MOUSE, "Mouse Event (Boot Protocol, len=%d)", data_length);
+      }
+      else
+      {
+        ESP_LOGI(TAG_MOUSE, "Mouse Event (Report Protocol, len=%d)", data_length);
+      }
+      hid_host_mouse_report_callback(hid_device_handle, data, data_length);
     }
     else
     {
-      ESP_LOGI(TAG_GENERIC, "Generic Event");
+      // 其他协议类型
+      if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class)
+      {
+        ESP_LOGI(TAG_GENERIC, "Generic Boot Interface Event (len=%d)", data_length);
+      }
+      else
+      {
+        ESP_LOGI(TAG_GENERIC, "Generic Event (Report Protocol, len=%d)", data_length);
+      }
       hid_host_generic_report_callback(data, data_length);
     }
 
@@ -428,7 +609,17 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
     ESP_LOGI(TAG_USB, "  协议: %s", hid_proto_name_str[dev_params.proto]);
     ESP_LOGI(TAG_USB, "=========================================");
     ESP_ERROR_CHECK(hid_host_device_close(hid_device_handle));
-    evt_queue.hid_host_device.handle = NULL;
+
+    // 从设备列表中移除对应的设备
+    if (dev_params.proto == HID_PROTOCOL_KEYBOARD)
+    {
+      usb_hid_devices.keyboard_handle = NULL;
+    }
+    else if (dev_params.proto == HID_PROTOCOL_MOUSE)
+    {
+      usb_hid_devices.mouse_handle = NULL;
+    }
+
     set_led_color();
     break;
   case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
@@ -493,15 +684,32 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
         .callback_arg = NULL};
 
     ESP_ERROR_CHECK(hid_host_device_open(hid_device_handle, &dev_config));
+
+    // macOS使用Report Protocol，对所有Boot Interface设备都设置为Report Protocol
     if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class)
     {
-      // ESP_ERROR_CHECK(hid_class_request_set_protocol(hid_device_handle, HID_REPORT_PROTOCOL_BOOT));
+      // 强制使用Report Protocol（macOS兼容）
       ESP_ERROR_CHECK(hid_class_request_set_protocol(hid_device_handle, HID_REPORT_PROTOCOL_REPORT));
-      if (HID_PROTOCOL_KEYBOARD == dev_params.proto)
-      {
-        ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
-      }
+      ESP_LOGI(TAG_HID, "已设置USB设备为Report Protocol模式（macOS兼容）");
     }
+    // 非Boot Interface设备默认使用Report Protocol，无需设置
+
+    // 根据协议类型注册设备
+    if (HID_PROTOCOL_KEYBOARD == dev_params.proto)
+    {
+      ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
+      // 保存键盘设备句柄
+      usb_hid_devices.keyboard_handle = hid_device_handle;
+      ESP_LOGI(TAG_KEYBOARD, "键盘设备已注册");
+    }
+    else if (HID_PROTOCOL_MOUSE == dev_params.proto)
+    {
+      ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
+      // 保存鼠标设备句柄
+      usb_hid_devices.mouse_handle = hid_device_handle;
+      ESP_LOGI(TAG_MOUSE, "鼠标设备已注册");
+    }
+
     ESP_ERROR_CHECK(hid_host_device_start(hid_device_handle));
     set_led_color();
     break;
@@ -640,21 +848,31 @@ led_strip_handle_t configure_led(void)
  */
 void set_led_color()
 {
-  printf("USB HID: %d, BLE HID: %d\n", evt_queue.hid_host_device.handle != NULL ? true : false, sec_conn);
-  if (evt_queue.hid_host_device.handle && sec_conn)
+  bool usb_device_connected = (usb_hid_devices.keyboard_handle != NULL || usb_hid_devices.mouse_handle != NULL);
+  printf("USB HID: %s (键盘:%s, 鼠标:%s), BLE HID: %s\n",
+         usb_device_connected ? "已连接" : "未连接",
+         usb_hid_devices.keyboard_handle != NULL ? "是" : "否",
+         usb_hid_devices.mouse_handle != NULL ? "是" : "否",
+         sec_conn ? "已连接" : "未连接");
+
+  if (usb_device_connected && sec_conn)
   {
+    // USB设备已连接且BLE已连接 - 白色
     ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, LED_BRIGHTNESS, LED_BRIGHTNESS, LED_BRIGHTNESS));
   }
-  else if (evt_queue.hid_host_device.handle)
+  else if (usb_device_connected)
   {
+    // USB设备已连接但BLE未连接 - 绿色
     ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, LED_BRIGHTNESS, 0));
   }
   else if (sec_conn)
   {
+    // BLE已连接但USB设备未连接 - 蓝色
     ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, 0, LED_BRIGHTNESS));
   }
   else
   {
+    // 都未连接 - 红色
     ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, LED_BRIGHTNESS, 0, 0));
   }
   ESP_ERROR_CHECK(led_strip_refresh(led_strip));
@@ -777,7 +995,7 @@ void app_main(void)
   }
 
   ESP_LOGI(TAG_HID, "等待USB HID设备连接...");
-  ESP_LOGI(TAG_USB, "提示: 请插入USB键盘设备");
+  ESP_LOGI(TAG_USB, "提示: 请插入USB键盘或鼠标设备");
 
   led_strip = configure_led();
   set_led_color();
@@ -804,8 +1022,9 @@ void app_main(void)
     TickType_t now = xTaskGetTickCount();
     if ((now - last_heartbeat) >= heartbeat_interval)
     {
-      ESP_LOGI(TAG_USB, "系统运行中，等待USB设备... (USB HID: %s, BLE HID: %s)",
-               evt_queue.hid_host_device.handle != NULL ? "已连接" : "未连接",
+      ESP_LOGI(TAG_USB, "USB: 系统运行中，等待USB设备... (USB键盘: %s, USB鼠标: %s, BLE HID: %s)",
+               usb_hid_devices.keyboard_handle != NULL ? "已连接" : "未连接",
+               usb_hid_devices.mouse_handle != NULL ? "已连接" : "未连接",
                sec_conn ? "已连接" : "未连接");
       last_heartbeat = now;
     }
