@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
 #include "esp_log.h"
+#include <stdbool.h>
 #include "hid_report_parser.h"
 
 static const char *TAG = "HID_PARSER";
@@ -352,7 +354,7 @@ void parse_hid_report_descriptor(const uint8_t *desc, size_t length)
                 break;
             case 0x06: // Unit
                 unit = item_value;
-                printf("Unit(0x%08" PRIX32 ")", unit);
+                printf("Unit(0x%08" PRIX32 ")", (unsigned long)unit);
                 break;
             case 0x07: // Report Size
                 report_size = item_value;
@@ -616,4 +618,417 @@ void parse_hid_report_descriptor(const uint8_t *desc, size_t length)
     }
 
     ESP_LOGI(TAG, "========== 解析完成 ==========\n");
+}
+
+int parse_hid_report_descriptor_layout(const uint8_t *desc, size_t length, hid_report_layout_t *out_layout)
+{
+    if (desc == NULL || length == 0 || out_layout == NULL)
+    {
+        return -1;
+    }
+    // We'll collect per-report information and then select appropriate layout(s).
+    // Support up to 256 report IDs (0..255)
+    hid_report_layout_t tmp_layouts[256];
+    uint8_t report_used[256] = {0};
+    uint32_t report_bits[256];
+    for (int i = 0; i < 256; i++)
+    {
+        memset(&tmp_layouts[i], 0, sizeof(hid_report_layout_t));
+        report_bits[i] = 0;
+    }
+
+    size_t offset = 0;
+    uint32_t usage_page = 0;
+    uint32_t report_size = 0, report_count = 0;
+    uint8_t current_report_id = 0;
+
+    // Local items
+    uint32_t last_usage = 0;
+    uint32_t usage_min = 0, usage_max = 0;
+    bool have_usage_min_max = false;
+
+    while (offset < length)
+    {
+        uint8_t item = desc[offset];
+        uint8_t item_type = (item >> 2) & 0x03; // 0=Main,1=Global,2=Local
+        uint8_t item_tag = (item >> 4) & 0x0F;
+        uint8_t item_size = item & 0x03; // 0,1,2,3(==4)
+
+        size_t payload_bytes = (item_size == 3) ? 4 : item_size;
+
+        if (offset + payload_bytes >= length)
+        {
+            break;
+        }
+
+        uint32_t item_value = 0;
+        for (size_t i = 0; i < payload_bytes; i++)
+        {
+            item_value |= ((uint32_t)desc[offset + 1 + i]) << (8 * i);
+        }
+
+        if (item_type == 1) // Global
+        {
+            switch (item_tag)
+            {
+            case 0x00: // Usage Page
+                usage_page = item_value;
+                break;
+            case 0x07: // Report Size
+                report_size = item_value;
+                break;
+            case 0x08: // Report Count
+                report_count = item_value;
+                break;
+            case 0x09: // Report ID
+                current_report_id = (uint8_t)item_value;
+                // initialize report_bits if first seen
+                if (!report_used[current_report_id])
+                {
+                    report_used[current_report_id] = 1;
+                    report_bits[current_report_id] = current_report_id ? 8 : 0;
+                    tmp_layouts[current_report_id].report_id = current_report_id;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        else if (item_type == 2) // Local
+        {
+            switch (item_tag)
+            {
+            case 0x00: // Usage
+                last_usage = item_value;
+                have_usage_min_max = false;
+                break;
+            case 0x01: // Usage Minimum
+                usage_min = item_value;
+                have_usage_min_max = true;
+                break;
+            case 0x02: // Usage Maximum
+                usage_max = item_value;
+                have_usage_min_max = true;
+                break;
+            default:
+                break;
+            }
+        }
+        else if (item_type == 0) // Main
+        {
+            switch (item_tag)
+            {
+            case 0x08: // Input
+            {
+                // Only consider Data fields (bit 0 == 1). Skip Constant fields.
+                if ((item_value & 0x01) == 0)
+                {
+                    // advance bit offset anyway (constants also occupy bits)
+                    if (report_used[current_report_id])
+                        report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
+                    last_usage = 0;
+                    have_usage_min_max = false;
+                    break;
+                }
+
+                // Ensure current report is marked
+                if (!report_used[current_report_id])
+                {
+                    report_used[current_report_id] = 1;
+                    report_bits[current_report_id] = current_report_id ? 8 : 0;
+                    tmp_layouts[current_report_id].report_id = current_report_id;
+                }
+
+                uint32_t base_bit = report_bits[current_report_id];
+
+                if (usage_page == 0x09)
+                {
+                    // Buttons
+                    if (tmp_layouts[current_report_id].buttons_count == 0)
+                    {
+                        tmp_layouts[current_report_id].buttons_bit_offset = base_bit;
+                        tmp_layouts[current_report_id].buttons_count = (uint16_t)report_count;
+                    }
+                }
+                else if (usage_page == 0x01)
+                {
+                    if (have_usage_min_max)
+                    {
+                        for (uint32_t u = usage_min; u <= usage_max; u++)
+                        {
+                            if (u == 0x30) // X
+                            {
+                                if (tmp_layouts[current_report_id].x_size == 0)
+                                {
+                                    tmp_layouts[current_report_id].x_bit_offset = base_bit + (u - usage_min) * report_size;
+                                    tmp_layouts[current_report_id].x_size = report_size;
+                                }
+                            }
+                            else if (u == 0x31) // Y
+                            {
+                                if (tmp_layouts[current_report_id].y_size == 0)
+                                {
+                                    tmp_layouts[current_report_id].y_bit_offset = base_bit + (u - usage_min) * report_size;
+                                    tmp_layouts[current_report_id].y_size = report_size;
+                                }
+                            }
+                            else if (u == 0x38) // Wheel
+                            {
+                                if (tmp_layouts[current_report_id].wheel_size == 0)
+                                {
+                                    tmp_layouts[current_report_id].wheel_bit_offset = base_bit + (u - usage_min) * report_size;
+                                    tmp_layouts[current_report_id].wheel_size = report_size;
+                                }
+                            }
+                        }
+                    }
+                    else if (last_usage)
+                    {
+                        uint32_t u = last_usage;
+                        if (u == 0x30) // X
+                        {
+                            if (tmp_layouts[current_report_id].x_size == 0)
+                            {
+                                tmp_layouts[current_report_id].x_bit_offset = base_bit;
+                                tmp_layouts[current_report_id].x_size = report_size;
+                            }
+                        }
+                        else if (u == 0x31) // Y
+                        {
+                            if (tmp_layouts[current_report_id].y_size == 0)
+                            {
+                                tmp_layouts[current_report_id].y_bit_offset = base_bit;
+                                tmp_layouts[current_report_id].y_size = report_size;
+                            }
+                        }
+                        else if (u == 0x38) // Wheel
+                        {
+                            if (tmp_layouts[current_report_id].wheel_size == 0)
+                            {
+                                tmp_layouts[current_report_id].wheel_bit_offset = base_bit;
+                                tmp_layouts[current_report_id].wheel_size = report_size;
+                            }
+                        }
+                    }
+                }
+
+                // advance bit offset
+                report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
+
+                // Clear local items per HID spec
+                last_usage = 0;
+                have_usage_min_max = false;
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+        offset += 1 + payload_bytes;
+    }
+
+    // Select a single layout as legacy behavior: prefer a report that has buttons + x + y.
+    for (int rid = 0; rid < 256; rid++)
+    {
+        if (report_used[rid])
+        {
+            tmp_layouts[rid].report_size_bits = report_bits[rid];
+            // return first layout that has buttons + x + y
+            if (tmp_layouts[rid].buttons_count > 0 && tmp_layouts[rid].x_size > 0 && tmp_layouts[rid].y_size > 0)
+            {
+                // copy to out
+                memcpy(out_layout, &tmp_layouts[rid], sizeof(hid_report_layout_t));
+                return 0;
+            }
+        }
+    }
+
+    // fallback: if any layout had data fields, return the first one
+    for (int rid = 0; rid < 256; rid++)
+    {
+        if (report_used[rid])
+        {
+            memcpy(out_layout, &tmp_layouts[rid], sizeof(hid_report_layout_t));
+            return -1;
+        }
+    }
+
+    return -1;
+}
+
+int parse_hid_report_descriptor_layouts(const uint8_t *desc, size_t length, hid_report_layout_t *layouts, size_t max_layouts)
+{
+    if (desc == NULL || length == 0 || layouts == NULL || max_layouts == 0)
+        return 0;
+
+    // Reuse logic: build tmp per-report layouts similar to single-layout parser
+    hid_report_layout_t tmp_layouts[256];
+    uint8_t report_used[256] = {0};
+    uint32_t report_bits[256];
+    for (int i = 0; i < 256; i++)
+    {
+        memset(&tmp_layouts[i], 0, sizeof(hid_report_layout_t));
+        report_bits[i] = 0;
+    }
+
+    size_t offset = 0;
+    uint32_t usage_page = 0;
+    uint32_t report_size = 0, report_count = 0;
+    uint8_t current_report_id = 0;
+    uint32_t last_usage = 0;
+    uint32_t usage_min = 0, usage_max = 0;
+    bool have_usage_min_max = false;
+
+    while (offset < length)
+    {
+        uint8_t item = desc[offset];
+        uint8_t item_type = (item >> 2) & 0x03;
+        uint8_t item_tag = (item >> 4) & 0x0F;
+        uint8_t item_size = item & 0x03;
+        size_t payload_bytes = (item_size == 3) ? 4 : item_size;
+        if (offset + payload_bytes >= length)
+            break;
+        uint32_t item_value = 0;
+        for (size_t i = 0; i < payload_bytes; i++)
+            item_value |= ((uint32_t)desc[offset + 1 + i]) << (8 * i);
+
+        if (item_type == 1)
+        {
+            switch (item_tag)
+            {
+            case 0x00:
+                usage_page = item_value;
+                break;
+            case 0x07:
+                report_size = item_value;
+                break;
+            case 0x08:
+                report_count = item_value;
+                break;
+            case 0x09:
+                current_report_id = (uint8_t)item_value;
+                if (!report_used[current_report_id])
+                {
+                    report_used[current_report_id] = 1;
+                    report_bits[current_report_id] = current_report_id ? 8 : 0;
+                    tmp_layouts[current_report_id].report_id = current_report_id;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        else if (item_type == 2)
+        {
+            switch (item_tag)
+            {
+            case 0x00:
+                last_usage = item_value;
+                have_usage_min_max = false;
+                break;
+            case 0x01:
+                usage_min = item_value;
+                have_usage_min_max = true;
+                break;
+            case 0x02:
+                usage_max = item_value;
+                have_usage_min_max = true;
+                break;
+            default:
+                break;
+            }
+        }
+        else if (item_type == 0)
+        {
+            if (item_tag == 0x08)
+            {
+                // Input
+                if ((item_value & 0x01) == 0)
+                {
+                    if (report_used[current_report_id])
+                        report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
+                }
+                else
+                {
+                    if (!report_used[current_report_id])
+                    {
+                        report_used[current_report_id] = 1;
+                        report_bits[current_report_id] = current_report_id ? 8 : 0;
+                        tmp_layouts[current_report_id].report_id = current_report_id;
+                    }
+                    uint32_t base_bit = report_bits[current_report_id];
+                    if (usage_page == 0x09)
+                    {
+                        if (tmp_layouts[current_report_id].buttons_count == 0)
+                        {
+                            tmp_layouts[current_report_id].buttons_bit_offset = base_bit;
+                            tmp_layouts[current_report_id].buttons_count = (uint16_t)report_count;
+                        }
+                    }
+                    else if (usage_page == 0x01)
+                    {
+                        if (have_usage_min_max)
+                        {
+                            for (uint32_t u = usage_min; u <= usage_max; u++)
+                            {
+                                if (u == 0x30 && tmp_layouts[current_report_id].x_size == 0)
+                                {
+                                    tmp_layouts[current_report_id].x_bit_offset = base_bit + (u - usage_min) * report_size;
+                                    tmp_layouts[current_report_id].x_size = report_size;
+                                }
+                                else if (u == 0x31 && tmp_layouts[current_report_id].y_size == 0)
+                                {
+                                    tmp_layouts[current_report_id].y_bit_offset = base_bit + (u - usage_min) * report_size;
+                                    tmp_layouts[current_report_id].y_size = report_size;
+                                }
+                                else if (u == 0x38 && tmp_layouts[current_report_id].wheel_size == 0)
+                                {
+                                    tmp_layouts[current_report_id].wheel_bit_offset = base_bit + (u - usage_min) * report_size;
+                                    tmp_layouts[current_report_id].wheel_size = report_size;
+                                }
+                            }
+                        }
+                        else if (last_usage)
+                        {
+                            uint32_t u = last_usage;
+                            if (u == 0x30 && tmp_layouts[current_report_id].x_size == 0)
+                            {
+                                tmp_layouts[current_report_id].x_bit_offset = base_bit;
+                                tmp_layouts[current_report_id].x_size = report_size;
+                            }
+                            else if (u == 0x31 && tmp_layouts[current_report_id].y_size == 0)
+                            {
+                                tmp_layouts[current_report_id].y_bit_offset = base_bit;
+                                tmp_layouts[current_report_id].y_size = report_size;
+                            }
+                            else if (u == 0x38 && tmp_layouts[current_report_id].wheel_size == 0)
+                            {
+                                tmp_layouts[current_report_id].wheel_bit_offset = base_bit;
+                                tmp_layouts[current_report_id].wheel_size = report_size;
+                            }
+                        }
+                    }
+                    report_bits[current_report_id] += (uint32_t)report_count * (uint32_t)report_size;
+                    last_usage = 0;
+                    have_usage_min_max = false;
+                }
+            }
+        }
+
+        offset += 1 + payload_bytes;
+    }
+
+    // collect into output array
+    size_t out_count = 0;
+    for (int rid = 0; rid < 256 && out_count < (int)max_layouts; rid++)
+    {
+        if (report_used[rid])
+        {
+            tmp_layouts[rid].report_size_bits = report_bits[rid];
+            layouts[out_count++] = tmp_layouts[rid];
+        }
+    }
+
+    return (int)out_count;
 }
