@@ -463,34 +463,7 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   uint32_t buttons_u = 0;                 // buttons的完整值（可能超过8位）
   hid_report_layout_t *use_layout = NULL; // 用于判断是否从use_layout路径获取数据
 
-  // 打印原始数据用于调试（基于 Zephyr report map 的5字节报告）- 已禁用以提高性能
-  // if (length == 5)
-  // {
-  //   ESP_LOGD(TAG_MOUSE, "Raw 5-byte report: %02X %02X %02X %02X %02X",
-  //            data[0], data[1], data[2], data[3], data[4]);
-  // }
-
-  // 调试：打印原始 USB 报告数据（仅当有数据变化时）
-  static uint8_t last_data[16] = {0};
-  static int last_length = 0;
-  bool data_changed = (length != last_length) || (memcmp(data, last_data, length < 16 ? length : 16) != 0);
-
-  if (data_changed && (length > 0))
-  {
-    ESP_LOGI(TAG_MOUSE, "========== USB Mouse Report (length=%d) ==========", length);
-    ESP_LOG_BUFFER_HEX(TAG_MOUSE, data, length);
-
-    // 保存当前数据用于下次比较
-    last_length = length;
-    if (length < 16)
-    {
-      memcpy(last_data, data, length);
-    }
-    else
-    {
-      memcpy(last_data, data, 16);
-    }
-  }
+  // 调试日志已移除以提高鼠标回报率性能
 
   // 根据报告长度自动判断协议类型和格式
   if (length == sizeof(hid_mouse_input_report_boot_t))
@@ -637,12 +610,12 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
       y = use_layout->y_size ? (int16_t)y_raw : 0;
       wheel = use_layout->wheel_size ? (int8_t)wheel_raw : 0;
 
-      // 调试：打印提取的原始数据（仅当有移动时）
-      if (x_raw != 0 || y_raw != 0 || wheel_raw != 0)
-      {
-        ESP_LOGI(TAG_MOUSE, "[USB->BLE 数据提取] x_raw=%d -> x=%d, y_raw=%d -> y=%d, wheel_raw=%d -> wheel=%d",
-                 (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel_raw, (int)wheel);
-      }
+      // 调试日志已禁用以提高鼠标回报率性能
+      // if (x_raw != 0 || y_raw != 0 || wheel_raw != 0)
+      // {
+      //   ESP_LOGI(TAG_MOUSE, "[USB->BLE 数据提取] x_raw=%d -> x=%d, y_raw=%d -> y=%d, wheel_raw=%d -> wheel=%d",
+      //            (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel_raw, (int)wheel);
+      // }
 
       // 注意：pan（水平滚动）数据在 BLE 报告中不被使用，因此不提取
       // 参考 asterics 仓库逻辑，不处理 pan 数据
@@ -809,47 +782,41 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   ble_mouse_report[5] = (uint8_t)wheel; // 滚轮（类型转换自动处理）
 #endif
 
-  // 打印发送的数据用于手动校验
-  static bool first_print = true;
+  // 打印发送的数据用于手动校验（仅第一次打印格式说明，已禁用以提高性能）
+  // static bool first_print = true;
+  // if (first_print)
+  // {
+  //   ESP_LOGI(TAG_MOUSE, "========== 鼠标数据发送格式 (基于 Zephyr report map) ==========");
+  //   ESP_LOGI(TAG_MOUSE, "USE_16BIT_MOUSE_PRECISION = %d", USE_16BIT_MOUSE_PRECISION);
+  //   ESP_LOGI(TAG_MOUSE, "HID_MOUSE_IN_RPT_LEN = %d 字节", HID_MOUSE_IN_RPT_LEN);
+  //   ESP_LOGI(TAG_MOUSE, "数据布局: [按钮(1)] [X低(1)] [X高(1)] [Y低(1)] [Y高(1)] [Wheel(1)]");
+  //   ESP_LOGI(TAG_MOUSE, "字节索引:   0        1       2       3       4       5");
+  //   ESP_LOGI(TAG_MOUSE, "字段说明: 按钮(3位+5位padding) + X(16位) + Y(16位) + Wheel(8位) = 6字节");
+  //   ESP_LOGI(TAG_MOUSE, "兼容性: X/Y 定义为 16bit，兼容 8bit 和 16bit 数据");
+  //   ESP_LOGI(TAG_MOUSE, "================================================================");
+  //   first_print = false;
+  // }
 
-  // 第一次打印时显示详细信息
-  if (first_print)
-  {
-    ESP_LOGI(TAG_MOUSE, "========== 鼠标数据发送格式 (基于 Zephyr report map) ==========");
-    ESP_LOGI(TAG_MOUSE, "USE_16BIT_MOUSE_PRECISION = %d", USE_16BIT_MOUSE_PRECISION);
-    ESP_LOGI(TAG_MOUSE, "HID_MOUSE_IN_RPT_LEN = %d 字节", HID_MOUSE_IN_RPT_LEN);
-    ESP_LOGI(TAG_MOUSE, "数据布局: [按钮(1)] [X低(1)] [X高(1)] [Y低(1)] [Y高(1)] [Wheel(1)]");
-    ESP_LOGI(TAG_MOUSE, "字节索引:   0        1       2       3       4       5");
-    ESP_LOGI(TAG_MOUSE, "字段说明: 按钮(3位+5位padding) + X(16位) + Y(16位) + Wheel(8位) = 6字节");
-    ESP_LOGI(TAG_MOUSE, "兼容性: X/Y 定义为 16bit，兼容 8bit 和 16bit 数据");
-    ESP_LOGI(TAG_MOUSE, "================================================================");
-    first_print = false;
-  }
-
-  // 每次有效移动时都打印（用于手动校验）
-  if (x != 0 || y != 0 || wheel != 0 || buttons != 0)
-  {
-    // 验证数据打包：检查buttons、X/Y的little-endian格式
-    uint8_t buttons_verify = ble_mouse_report[0] & 0x07; // 只取低3位
-    uint16_t x_le = (uint16_t)((ble_mouse_report[2] << 8) | ble_mouse_report[1]);
-    uint16_t y_le = (uint16_t)((ble_mouse_report[4] << 8) | ble_mouse_report[3]);
-    int16_t x_verify = (int16_t)x_le;
-    int16_t y_verify = (int16_t)y_le;
-
-    ESP_LOGI(TAG_MOUSE, "[发送数据] buttons=0x%02X(3bit), x=%d->%d(0x%04X), y=%d->%d(0x%04X), wheel=%d",
-             buttons_verify, (int)x, (int)x_verify, (unsigned int)x_le,
-             (int)y, (int)y_verify, (unsigned int)y_le, (int)wheel);
-
-    ESP_LOGI(TAG_MOUSE, "[原始字节] %02X %02X %02X %02X %02X %02X",
-             ble_mouse_report[0], ble_mouse_report[1], ble_mouse_report[2],
-             ble_mouse_report[3], ble_mouse_report[4], ble_mouse_report[5]);
-
-    ESP_LOGI(TAG_MOUSE, "[字段解析] 按钮[0]=0x%02X(3bit), X[1-2]=%d(0x%04X), Y[3-4]=%d(0x%04X), Wheel[5]=%d(0x%02X)",
-             buttons_verify,
-             (int)x_verify, (unsigned int)x_le,
-             (int)y_verify, (unsigned int)y_le,
-             (int)wheel, (unsigned int)ble_mouse_report[5]);
-  }
+  // 每次有效移动时的详细日志已禁用以提高鼠标回报率性能
+  // if (x != 0 || y != 0 || wheel != 0 || buttons != 0)
+  // {
+  //   uint8_t buttons_verify = ble_mouse_report[0] & 0x07;
+  //   uint16_t x_le = (uint16_t)((ble_mouse_report[2] << 8) | ble_mouse_report[1]);
+  //   uint16_t y_le = (uint16_t)((ble_mouse_report[4] << 8) | ble_mouse_report[3]);
+  //   int16_t x_verify = (int16_t)x_le;
+  //   int16_t y_verify = (int16_t)y_le;
+  //   ESP_LOGI(TAG_MOUSE, "[发送数据] buttons=0x%02X(3bit), x=%d->%d(0x%04X), y=%d->%d(0x%04X), wheel=%d",
+  //            buttons_verify, (int)x, (int)x_verify, (unsigned int)x_le,
+  //            (int)y, (int)y_verify, (unsigned int)y_le, (int)wheel);
+  //   ESP_LOGI(TAG_MOUSE, "[原始字节] %02X %02X %02X %02X %02X %02X",
+  //            ble_mouse_report[0], ble_mouse_report[1], ble_mouse_report[2],
+  //            ble_mouse_report[3], ble_mouse_report[4], ble_mouse_report[5]);
+  //   ESP_LOGI(TAG_MOUSE, "[字段解析] 按钮[0]=0x%02X(3bit), X[1-2]=%d(0x%04X), Y[3-4]=%d(0x%04X), Wheel[5]=%d(0x%02X)",
+  //            buttons_verify,
+  //            (int)x_verify, (unsigned int)x_le,
+  //            (int)y_verify, (unsigned int)y_le,
+  //            (int)wheel, (unsigned int)ble_mouse_report[5]);
+  // }
 
   // 发送到BLE HID设备
   // remember last buttons state for separated reports
