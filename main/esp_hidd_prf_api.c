@@ -18,7 +18,18 @@
 #define HID_LED_OUT_RPT_LEN 1
 
 // HID mouse input report length
-#define HID_MOUSE_IN_RPT_LEN 4 // macOS兼容：按钮(1) + X(1) + Y(1) + Wheel(1) = 4字节
+// 配置选项：使用16位精度（1）或8位精度（0）
+// 注意：Report Map 中 X/Y 定义为 16bit 以兼容 8bit 和 16bit
+// 如果 USE_16BIT_MOUSE_PRECISION=1，发送完整的 16bit 数据
+// 如果 USE_16BIT_MOUSE_PRECISION=0，发送 8bit 数据但放在 16bit 字段中
+// 注意：此宏必须与hid_device_le_prf.c和hid_host_example.c中的定义保持一致
+#ifndef USE_16BIT_MOUSE_PRECISION
+#define USE_16BIT_MOUSE_PRECISION 1
+#endif
+
+// 基于 Zephyr report map: 按钮(1字节: 3位按钮+5位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
+// 注意：即使发送 8bit 数据，报告长度仍为 6 字节（8bit 数据放在 16bit 字段的低 8 位）
+#define HID_MOUSE_IN_RPT_LEN 6 // 按钮(1) + X(2) + Y(2) + Wheel(1) = 6字节（兼容 8bit 和 16bit）
 
 // HID consumer control input report length
 #define HID_CC_IN_RPT_LEN 2
@@ -141,12 +152,37 @@ void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask,
 
 void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y)
 {
-  uint8_t buffer[HID_MOUSE_IN_RPT_LEN];
+  uint8_t buffer[HID_MOUSE_IN_RPT_LEN] = {0};
 
-  buffer[0] = mouse_button; // Buttons
-  buffer[1] = mickeys_x;    // X
-  buffer[2] = mickeys_y;    // Y
-  buffer[3] = 0;            // Wheel
+  // 按钮：只使用低3位（左、右、中键），高5位为padding（自动为0）
+  buffer[0] = mouse_button & 0x07; // 只保留低3位，符合 Zephyr report map 的3个按钮定义
+
+#if USE_16BIT_MOUSE_PRECISION
+  // 16位格式：发送完整的16位数据
+  // X位移（16位，little-endian）
+  int16_t x_16 = (int16_t)mickeys_x;
+  buffer[1] = (uint8_t)(x_16 & 0xFF);
+  buffer[2] = (uint8_t)((x_16 >> 8) & 0xFF);
+
+  // Y位移（16位，little-endian）
+  int16_t y_16 = (int16_t)mickeys_y;
+  buffer[3] = (uint8_t)(y_16 & 0xFF);
+  buffer[4] = (uint8_t)((y_16 >> 8) & 0xFF);
+#else
+  // 8位格式：将8位数据放在16位字段的低8位，高8位为0（符号扩展）
+  // X位移（16位，little-endian）- 8位数据放在低8位
+  int16_t x_16 = (int16_t)(int8_t)mickeys_x; // 符号扩展
+  buffer[1] = (uint8_t)(x_16 & 0xFF);
+  buffer[2] = (uint8_t)((x_16 >> 8) & 0xFF);
+
+  // Y位移（16位，little-endian）- 8位数据放在低8位
+  int16_t y_16 = (int16_t)(int8_t)mickeys_y; // 符号扩展
+  buffer[3] = (uint8_t)(y_16 & 0xFF);
+  buffer[4] = (uint8_t)((y_16 >> 8) & 0xFF);
+#endif
+
+  // Wheel字段（字节5），默认为0（此函数不支持滚轮参数，需要单独的函数）
+  buffer[5] = 0;
 
   hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                       HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, HID_MOUSE_IN_RPT_LEN, buffer);

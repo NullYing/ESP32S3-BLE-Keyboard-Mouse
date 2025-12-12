@@ -44,9 +44,24 @@
    ================================================================================================= */
 #define CHAR_DECLARATION_SIZE (sizeof(uint8_t))
 #define HID_KEYBOARD_IN_RPT_LEN 8
-#define HID_MOUSE_IN_RPT_LEN 4 // macOS兼容：按钮(1) + X(1) + Y(1) + Wheel(1) = 4字节
+// 配置选项：使用16位精度（1）或8位精度（0）
+// 注意：Report Map 中 X/Y 定义为 16bit 以兼容 8bit 和 16bit
+// 如果 USE_16BIT_MOUSE_PRECISION=1，发送完整的 16bit 数据
+// 如果 USE_16BIT_MOUSE_PRECISION=0，发送 8bit 数据但放在 16bit 字段中
+// 注意：此宏必须与hid_device_le_prf.c和esp_hidd_prf_api.c中的定义保持一致
+#define USE_16BIT_MOUSE_PRECISION 1
+
+// 基于 Zephyr report map: 按钮(1字节: 3位按钮+5位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
+// 注意：即使发送 8bit 数据，报告长度仍为 6 字节（8bit 数据放在 16bit 字段的低 8 位）
+#define HID_MOUSE_IN_RPT_LEN 6 // 按钮(1) + X(2) + Y(2) + Wheel(1) = 6字节（兼容 8bit 和 16bit）
 #define HID_CC_IN_RPT_LEN 2
 #define BLE_HID_DEVICE_NAME "BLE HID"
+
+// HID Report ID 相关常量
+// 根据 HID 规范，Report ID 通常是 1 字节（8 位）
+// Parser 返回的 bit_offset 是相对于报告数据开始（不包括 report_id）的
+// 因此如果 report_id 存在，需要调整 8 位以跳过 report_id
+#define HID_REPORT_ID_SIZE_BITS 8 // Report ID 的位宽（1 字节 = 8 位）
 
 #define LED_GPIO_PIN 21
 #define LED_RMT_RES_HZ (10 * 1000 * 1000)
@@ -87,8 +102,8 @@ static esp_ble_adv_data_t ble_hid_adv_data = {
     .set_scan_rsp = false,
     .include_name = true,
     .include_txpower = true,
-    .min_interval = 0x0006, // slave connection min interval, Time = min_interval * 1.25 msec
-    .max_interval = 0x0010, // slave connection max interval, Time = max_interval * 1.25 msec
+    .min_interval = 0x0006, // slave connection min interval, Time = min_interval * 1.25 msec = 7.5ms
+    .max_interval = 0x0006, // slave connection max interval, Time = max_interval * 1.25 msec = 7.5ms (与min相同以获得固定间隔)
     .appearance = 0x03c0,   // HID Generic,
     .manufacturer_len = 0,
     .p_manufacturer_data = NULL,
@@ -175,6 +190,9 @@ static usb_hid_devices_t usb_hid_devices = {0};
 #define MAX_MOUSE_LAYOUTS 16
 static hid_report_layout_t g_mouse_layouts[MAX_MOUSE_LAYOUTS];
 static int g_mouse_layout_count = 0;
+// 缓存当前使用的layout指针，避免每次循环查找
+static hid_report_layout_t *g_cached_layout = NULL;
+static uint8_t g_cached_report_id = 0xFF; // 0xFF表示未缓存
 
 // LED
 led_strip_handle_t led_strip;
@@ -238,6 +256,18 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
   {
     ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_CONNECT");
     ble_hid_conn_id = param->connect.conn_id;
+
+    // 更新BLE连接参数以提高回报率
+    // min_interval = 0x0006 (7.5ms), max_interval = 0x0006 (7.5ms), latency = 0, timeout = 500 (625ms)
+    // 这些参数请求更短的连接间隔以获得更高的回报率
+    esp_ble_conn_update_params_t conn_params = {0};
+    memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+    conn_params.min_int = 0x0006; // 7.5ms (最小连接间隔)
+    conn_params.max_int = 0x0006; // 7.5ms (最大连接间隔，与min相同以获得固定间隔)
+    conn_params.latency = 0;      // 无延迟
+    conn_params.timeout = 0x0320; // 800 * 1.25ms = 1000ms 超时
+    esp_ble_gap_update_conn_params(&conn_params);
+    ESP_LOGI(TAG_BLE, "BLE连接参数已更新: interval=7.5ms, latency=0");
     break;
   }
   case ESP_HIDD_EVENT_BLE_DISCONNECT:
@@ -414,7 +444,8 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   // USB Report Protocol 鼠标报告格式：长度可变，可能包含 Report ID
   //   常见格式1：按钮(1) + X(1) + Y(1) + 滚轮(1) = 4字节
   //   常见格式2：Report ID(1) + 按钮(1) + X(1) + Y(1) + 滚轮(1) + 其他(3) = 8字节（macOS常见）
-  // BLE鼠标报告格式（macOS兼容）：按钮(1字节) + X位移(1字节) + Y位移(1字节) + 滚轮(1字节) = 4字节
+  // BLE鼠标报告格式（基于 Zephyr report map，兼容 8bit 和 16bit）：
+  //   按钮(1字节: 3位按钮+5位padding) + X(16位,2字节) + Y(16位,2字节) + Wheel(8位,1字节) = 6字节
 
   if (length < 3)
   {
@@ -423,16 +454,42 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   }
 
   uint8_t buttons;
-  int8_t x, y, wheel = 0;
-  int data_offset = 0;
+  int16_t x, y; // 改为16位以支持高精度
+  int8_t wheel = 0;
   static uint8_t last_buttons = 0;
   buttons = last_buttons; // default to last known buttons state
 
-  // 打印原始数据用于调试（仅8字节报告）
-  if (length == 8)
+  // 声明变量供后续打包使用
+  uint32_t buttons_u = 0;                 // buttons的完整值（可能超过8位）
+  hid_report_layout_t *use_layout = NULL; // 用于判断是否从use_layout路径获取数据
+
+  // 打印原始数据用于调试（基于 Zephyr report map 的5字节报告）- 已禁用以提高性能
+  // if (length == 5)
+  // {
+  //   ESP_LOGD(TAG_MOUSE, "Raw 5-byte report: %02X %02X %02X %02X %02X",
+  //            data[0], data[1], data[2], data[3], data[4]);
+  // }
+
+  // 调试：打印原始 USB 报告数据（仅当有数据变化时）
+  static uint8_t last_data[16] = {0};
+  static int last_length = 0;
+  bool data_changed = (length != last_length) || (memcmp(data, last_data, length < 16 ? length : 16) != 0);
+
+  if (data_changed && (length > 0))
   {
-    ESP_LOGI(TAG_MOUSE, "Raw 8-byte report: %02X %02X %02X %02X %02X %02X %02X %02X",
-             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+    ESP_LOGI(TAG_MOUSE, "========== USB Mouse Report (length=%d) ==========", length);
+    ESP_LOG_BUFFER_HEX(TAG_MOUSE, data, length);
+
+    // 保存当前数据用于下次比较
+    last_length = length;
+    if (length < 16)
+    {
+      memcpy(last_data, data, length);
+    }
+    else
+    {
+      memcpy(last_data, data, 16);
+    }
   }
 
   // 根据报告长度自动判断协议类型和格式
@@ -441,40 +498,68 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
     // Boot Protocol 格式：3字节（按钮+X+Y）
     hid_mouse_input_report_boot_t *mouse_report = (hid_mouse_input_report_boot_t *)data;
     buttons = mouse_report->buttons.val;
-    x = mouse_report->x_displacement;
-    y = mouse_report->y_displacement;
+    // 8位数据扩展为16位
+    x = (int16_t)mouse_report->x_displacement;
+    y = (int16_t)mouse_report->y_displacement;
     wheel = 0; // Boot Protocol 不支持滚轮
     ESP_LOGD(TAG_MOUSE, "Parsed as Boot Protocol (3 bytes)");
   }
-  else if (length >= 8)
+  else if (length >= 5) // 支持基于 Zephyr report map 的5字节格式，以及其他更长的格式
   {
     // First, if we have parsed layouts, try to find one matching this packet (by Report ID or size)
-    hid_report_layout_t *use_layout = NULL;
+    // use_layout已在函数开始处声明
     if (g_mouse_layout_count > 0)
     {
-      // try exact report_id match first
       uint8_t pid = data[0];
-      for (int i = 0; i < g_mouse_layout_count; i++)
+
+      // 尝试使用缓存的layout（性能优化）
+      if (g_cached_layout != NULL && g_cached_report_id == pid)
       {
-        if (g_mouse_layouts[i].report_id != 0 && pid == g_mouse_layouts[i].report_id)
+        // 验证缓存的layout仍然有效
+        if ((uint32_t)length * 8 >= g_cached_layout->report_size_bits)
         {
-          // ensure packet has enough bits
-          if ((uint32_t)length * 8 >= g_mouse_layouts[i].report_size_bits)
-          {
-            use_layout = &g_mouse_layouts[i];
-            break;
-          }
+          use_layout = g_cached_layout;
+        }
+        else
+        {
+          // 缓存失效，清除缓存
+          g_cached_layout = NULL;
+          g_cached_report_id = 0xFF;
         }
       }
-      // try report_id == 0 layouts (no report id)
+
+      // 如果缓存未命中，进行查找
       if (!use_layout)
       {
+        // try exact report_id match first
         for (int i = 0; i < g_mouse_layout_count; i++)
         {
-          if (g_mouse_layouts[i].report_id == 0 && (uint32_t)length * 8 >= g_mouse_layouts[i].report_size_bits)
+          if (g_mouse_layouts[i].report_id != 0 && pid == g_mouse_layouts[i].report_id)
           {
-            use_layout = &g_mouse_layouts[i];
-            break;
+            // ensure packet has enough bits
+            if ((uint32_t)length * 8 >= g_mouse_layouts[i].report_size_bits)
+            {
+              use_layout = &g_mouse_layouts[i];
+              // 缓存找到的layout
+              g_cached_layout = use_layout;
+              g_cached_report_id = pid;
+              break;
+            }
+          }
+        }
+        // try report_id == 0 layouts (no report id)
+        if (!use_layout)
+        {
+          for (int i = 0; i < g_mouse_layout_count; i++)
+          {
+            if (g_mouse_layouts[i].report_id == 0 && (uint32_t)length * 8 >= g_mouse_layouts[i].report_size_bits)
+            {
+              use_layout = &g_mouse_layouts[i];
+              // 缓存找到的layout
+              g_cached_layout = use_layout;
+              g_cached_report_id = 0; // report_id为0的情况
+              break;
+            }
           }
         }
       }
@@ -482,235 +567,300 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
 
     if (use_layout)
     {
-      // Adjust bit_offset if report_id is present (report_id takes 1 byte = 8 bits)
-      // The parser returns offsets relative to report data start (excluding report_id)
-      uint32_t bit_offset_adjust = (use_layout->report_id != 0) ? 8 : 0;
+      // ========================================================================
+      // Bit Offset 调整说明：
+      // ========================================================================
+      // HID Report Parser 返回的 bit_offset 是相对于报告数据开始计算的，
+      // 不包括 report_id。因此：
+      // - 如果 report_id 存在（非 0）：需要调整 bit_offset，跳过 report_id
+      // - 如果 report_id 不存在（0）：不需要调整，bit_offset 从数据开始计算
+      //
+      // 根据 HID 规范，Report ID 通常是 1 字节（8 位）
+      // 参考：hid_report_parser.c 中，当遇到新的 report_id 时，
+      //       current_bit_offset 会被重置为 0（从报告数据开始）
+      // ========================================================================
+      uint32_t bit_offset_adjust = 0;
+      if (use_layout->report_id != 0)
+      {
+        // Report ID 存在，需要跳过 report_id（1 字节 = 8 位）
+        bit_offset_adjust = HID_REPORT_ID_SIZE_BITS;
 
-      uint32_t buttons_u = get_bits_u32(data, length, use_layout->buttons_bit_offset + bit_offset_adjust, use_layout->buttons_count);
-      buttons = (uint8_t)(buttons_u & 0xFF);
+        // 验证数据长度是否足够（至少包含 report_id + 最小数据）
+        if (length < 2) // 至少需要 report_id(1) + 最小数据(1)
+        {
+          ESP_LOGW(TAG_MOUSE, "Report data too short: length=%d, expected at least 2 bytes (report_id + data)", length);
+          return;
+        }
+      }
+      // else: report_id == 0，不需要调整，bit_offset 从数据开始计算
+
+      // ========================================================================
+      // 调试：打印解析出的字段偏移量（仅打印一次）
+      // ========================================================================
+      static bool offset_printed = false;
+      if (!offset_printed)
+      {
+        ESP_LOGI(TAG_MOUSE, "========== Parsed Mouse Layout Offsets ==========");
+        ESP_LOGI(TAG_MOUSE, "Report ID: %u", use_layout->report_id);
+        ESP_LOGI(TAG_MOUSE, "Bit offset adjust: %" PRIu32 " bits", bit_offset_adjust);
+        ESP_LOGI(TAG_MOUSE, "Buttons: offset=%" PRIu32 " bits, count=%" PRIu32,
+                 use_layout->buttons_bit_offset + bit_offset_adjust, use_layout->buttons_count);
+        ESP_LOGI(TAG_MOUSE, "X: offset=%" PRIu32 " bits, size=%" PRIu32 " bits",
+                 use_layout->x_bit_offset + bit_offset_adjust, use_layout->x_size);
+        ESP_LOGI(TAG_MOUSE, "Y: offset=%" PRIu32 " bits, size=%" PRIu32 " bits",
+                 use_layout->y_bit_offset + bit_offset_adjust, use_layout->y_size);
+        ESP_LOGI(TAG_MOUSE, "Wheel: offset=%" PRIu32 " bits, size=%" PRIu32 " bits",
+                 use_layout->wheel_bit_offset + bit_offset_adjust, use_layout->wheel_size);
+        ESP_LOGI(TAG_MOUSE, "================================================");
+        offset_printed = true;
+      }
+
+      // ========================================================================
+      // Buttons 数据提取（参考 asterics 仓库逻辑）
+      // ========================================================================
+      // 直接提取完整的 buttons 值，不进行中间转换
+      // 在打包时直接使用 buttons_u & 0x07 获取低3位
+      // ========================================================================
+      buttons_u = get_bits_u32(data, length, use_layout->buttons_bit_offset + bit_offset_adjust, use_layout->buttons_count);
       int32_t x_raw = use_layout->x_size ? get_bits_s32(data, length, use_layout->x_bit_offset + bit_offset_adjust, use_layout->x_size) : 0;
       int32_t y_raw = use_layout->y_size ? get_bits_s32(data, length, use_layout->y_bit_offset + bit_offset_adjust, use_layout->y_size) : 0;
       int32_t wheel_raw = use_layout->wheel_size ? get_bits_s32(data, length, use_layout->wheel_bit_offset + bit_offset_adjust, use_layout->wheel_size) : 0;
 
-      // Clamp values based on the actual bit size
-      // For 8-bit: -128 to 127
-      // For 16-bit: -32768 to 32767
-      // For other sizes: use appropriate range
-      if (use_layout->x_size == 8)
-      {
-        if (x_raw > 127)
-          x = 127;
-        else if (x_raw < -128)
-          x = -128;
-        else
-          x = (int8_t)x_raw;
-      }
-      else if (use_layout->x_size == 16)
-      {
-        // For 16-bit values, clamp directly to int8_t range
-        // Don't divide by 256 as it would make all small values become 0
-        if (x_raw > 127)
-          x = 127;
-        else if (x_raw < -128)
-          x = -128;
-        else
-          x = (int8_t)x_raw;
-      }
-      else
-      {
-        // For other sizes, clamp to int8_t range
-        if (x_raw > 127)
-          x = 127;
-        else if (x_raw < -128)
-          x = -128;
-        else
-          x = (int8_t)x_raw;
-      }
-
-      if (use_layout->y_size == 8)
-      {
-        if (y_raw > 127)
-          y = 127;
-        else if (y_raw < -128)
-          y = -128;
-        else
-          y = (int8_t)y_raw;
-      }
-      else if (use_layout->y_size == 16)
-      {
-        // For 16-bit values, clamp directly to int8_t range
-        // Don't divide by 256 as it would make all small values become 0
-        if (y_raw > 127)
-          y = 127;
-        else if (y_raw < -128)
-          y = -128;
-        else
-          y = (int8_t)y_raw;
-      }
-      else
-      {
-        // For other sizes, clamp to int8_t range
-        if (y_raw > 127)
-          y = 127;
-        else if (y_raw < -128)
-          y = -128;
-        else
-          y = (int8_t)y_raw;
-      }
-
+      // ========================================================================
+      // X/Y/Wheel 数据转换（参考 asterics 仓库逻辑）
+      // ========================================================================
+      // 依赖类型转换自动处理，不进行显式 clamp
+      // get_bits_s32() 已经进行了符号扩展，直接转换为目标类型即可
+      // 类型转换会自动处理溢出（截断到目标类型的范围）
+      // ========================================================================
+      x = use_layout->x_size ? (int16_t)x_raw : 0;
+      y = use_layout->y_size ? (int16_t)y_raw : 0;
       wheel = use_layout->wheel_size ? (int8_t)wheel_raw : 0;
-      int32_t pan_raw = use_layout->pan_size ? get_bits_s32(data, length, use_layout->pan_bit_offset + bit_offset_adjust, use_layout->pan_size) : 0;
-      int8_t pan = use_layout->pan_size ? (int8_t)pan_raw : 0;
 
-      // Debug: print raw header bytes and where each field is located (bit offsets -> byte indexes)
+      // 调试：打印提取的原始数据（仅当有移动时）
+      if (x_raw != 0 || y_raw != 0 || wheel_raw != 0)
       {
-        int max_print = (length < 16) ? length : 16;
-        char buf[128] = {0};
-        int pos = 0;
-        for (int i = 0; i < max_print; i++)
-        {
-          pos += snprintf(&buf[pos], sizeof(buf) - pos, "%02X ", data[i]);
-        }
-        ESP_LOGD(TAG_MOUSE, "Raw report bytes (first %d): %s", max_print, buf);
-        uint32_t btn_byte = use_layout->buttons_bit_offset / 8;
-        uint32_t x_byte = use_layout->x_bit_offset / 8;
-        uint32_t y_byte = use_layout->y_bit_offset / 8;
-        uint32_t wheel_byte = use_layout->wheel_bit_offset / 8;
-        uint32_t pan_byte = use_layout->pan_bit_offset / 8;
-        ESP_LOGI(TAG_MOUSE, "Parsed by layout (rid=%u): report_bits=%u, buttons_bit=%u (byte %u), x_bit=%u (byte %u) size=%u, y_bit=%u (byte %u) size=%u, wheel_bit=%u (byte %u) size=%u, pan_bit=%u (byte %u) size=%u",
-                 (unsigned int)use_layout->report_id,
-                 (unsigned int)use_layout->report_size_bits,
-                 (unsigned int)use_layout->buttons_bit_offset, (unsigned int)btn_byte,
-                 (unsigned int)use_layout->x_bit_offset, (unsigned int)x_byte, (unsigned int)use_layout->x_size,
-                 (unsigned int)use_layout->y_bit_offset, (unsigned int)y_byte, (unsigned int)use_layout->y_size,
-                 (unsigned int)use_layout->wheel_bit_offset, (unsigned int)wheel_byte, (unsigned int)use_layout->wheel_size,
-                 (unsigned int)use_layout->pan_bit_offset, (unsigned int)pan_byte, (unsigned int)use_layout->pan_size);
-        ESP_LOGI(TAG_MOUSE, "fields: buttons_raw=0x%X, x_raw=%d->%d, y_raw=%d->%d, wheel=%d, pan=%d",
-                 (unsigned int)buttons_u, (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel, (int)pan);
+        ESP_LOGI(TAG_MOUSE, "[USB->BLE 数据提取] x_raw=%d -> x=%d, y_raw=%d -> y=%d, wheel_raw=%d -> wheel=%d",
+                 (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel_raw, (int)wheel);
       }
+
+      // 注意：pan（水平滚动）数据在 BLE 报告中不被使用，因此不提取
+      // 参考 asterics 仓库逻辑，不处理 pan 数据
     }
     else
     {
-      // 回退到原来的启发式/固定偏移解析（兼容旧设备）
-      // 检查是否是Report ID 0x02（鼠标主报告）
-      if (data[0] == 0x02)
+      // ========================================================================
+      // 回退逻辑：基本的固定偏移解析（参考 asterics 仓库逻辑）
+      // ========================================================================
+      // 简化回退逻辑，只支持基本的固定偏移解析
+      // 不支持 12 位数据的特殊处理，统一使用 8 位数据解析
+      // ========================================================================
+      if (data[0] > 0 && data[0] <= 0x0F)
       {
-        uint8_t B1 = data[1];
-        uint8_t B2 = data[2];
-        uint8_t B3 = data[3];
-        uint8_t B4 = data[4];
-        uint8_t B5 = data[5];
-        uint8_t B6 = data[6];
-        uint8_t B7 = data[7];
-
-        uint16_t buttons16 = (uint16_t)B1 | ((uint16_t)B2 << 8);
-        buttons = (uint8_t)(buttons16 & 0xFF);
-
-        uint16_t x_raw = (uint16_t)B3 | ((uint16_t)(B4 & 0x0F) << 8);
-        int16_t x_12bit = (x_raw & 0x0800) ? (int16_t)(x_raw | 0xF000) : (int16_t)x_raw;
-
-        uint16_t y_raw = (uint16_t)(B4 >> 4) | ((uint16_t)B5 << 4);
-        int16_t y_12bit = (y_raw & 0x0800) ? (int16_t)(y_raw | 0xF000) : (int16_t)y_raw;
-
-        if (x_12bit > 127)
-          x = 127;
-        else if (x_12bit < -127)
-          x = -127;
+        // 包含 Report ID 的格式：Report ID(1) + Buttons(1) + X(1) + Y(1) + Wheel(1)
+        if (length >= 5)
+        {
+          buttons = data[1];
+          x = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
+          y = (int16_t)(int8_t)data[3]; // 8位数据扩展为16位
+          wheel = (int8_t)data[4];
+        }
         else
-          x = (int8_t)x_12bit;
-
-        if (y_12bit > 127)
-          y = 127;
-        else if (y_12bit < -127)
-          y = -127;
-        else
-          y = (int8_t)y_12bit;
-
-        wheel = (int8_t)B6;
-        int8_t pan = (int8_t)B7;
-
-        // Debug: print original header bytes and how 12-bit X/Y are assembled
-        ESP_LOGD(TAG_MOUSE, "Header bytes: %02X %02X %02X %02X %02X %02X %02X", data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
-        ESP_LOGI(TAG_MOUSE,
-                 "Report ID 0x02: buttons=0x%04X, x_12=%d (raw=0x%03X)->%d, y_12=%d (raw=0x%03X)->%d, wheel=%d, pan=%d",
-                 buttons16, x_12bit, (unsigned int)x_raw, x, y_12bit, (unsigned int)y_raw, y, wheel, pan);
-        ESP_LOGI(TAG_MOUSE, "Detailed bits: B3=0x%02X, B4=0x%02X, B5=0x%02X -> x_raw=(B3|((B4&0x0F)<<8)), y_raw=((B4>>4)|B5<<4)", B3, B4, B5);
-      }
-      else if (data[0] > 0 && data[0] <= 0x0F)
-      {
-        ESP_LOGW(TAG_MOUSE, "Unhandled Report ID: 0x%02X, using default parsing", data[0]);
-        buttons = data[1];
-        x = (int8_t)data[2];
-        y = (int8_t)data[3];
-        wheel = (int8_t)data[4];
-        ESP_LOGI(TAG_MOUSE, "Other Report ID (0x%02X): buttons=0x%02X, x=%d, y=%d, wheel=%d",
-                 data[0], buttons, x, y, wheel);
+        {
+          ESP_LOGW(TAG_MOUSE, "Report with ID 0x%02X too short: length=%d, expected at least 5 bytes", data[0], length);
+          return;
+        }
       }
       else
       {
-        buttons = data[0];
-        x = (int8_t)data[1];
-        y = (int8_t)data[2];
-        wheel = (int8_t)data[3];
-        ESP_LOGI(TAG_MOUSE, "8-byte format (no Report ID): buttons=0x%02X, x=%d, y=%d, wheel=%d",
-                 buttons, x, y, wheel);
+        // 不包含 Report ID 的格式：Buttons(1) + X(1) + Y(1) + Wheel(1)
+        if (length >= 4)
+        {
+          buttons = data[0];
+          x = (int16_t)(int8_t)data[1]; // 8位数据扩展为16位
+          y = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
+          wheel = (int8_t)data[3];
+        }
+        else
+        {
+          ESP_LOGW(TAG_MOUSE, "Report without ID too short: length=%d, expected at least 4 bytes", length);
+          return;
+        }
       }
     }
   }
   else
   {
-    // 其他长度的Report Protocol格式（4字节等）
-    // 检查第一个字节是否是 Report ID
+    // ========================================================================
+    // 其他长度的 Report Protocol 格式处理（参考 asterics 仓库逻辑）
+    // ========================================================================
+    // 简化处理逻辑，统一使用基本的固定偏移解析
+    // ========================================================================
     if (length > 3 && data[0] > 0 && data[0] <= 0x0F)
     {
-      // 可能包含 Report ID，跳过第一个字节
-      data_offset = 1;
-      ESP_LOGD(TAG_MOUSE, "Report Protocol with Report ID: 0x%02X", data[0]);
-    }
-    else
-    {
-      // 没有 Report ID，直接从第一个字节开始解析
-      data_offset = 0;
-      ESP_LOGD(TAG_MOUSE, "Report Protocol without Report ID");
-    }
-
-    // 解析鼠标数据
-    if (length >= (data_offset + 3))
-    {
-      buttons = data[data_offset + 0];
-      x = (int8_t)data[data_offset + 1];
-      y = (int8_t)data[data_offset + 2];
-
-      // 如果长度足够，读取滚轮数据
-      if (length >= (data_offset + 4))
+      // 包含 Report ID 的格式：Report ID(1) + Buttons(1) + X(1) + Y(1) + Wheel(1)
+      if (length >= 5)
       {
-        wheel = (int8_t)data[data_offset + 3];
+        buttons = data[1];
+        x = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
+        y = (int16_t)(int8_t)data[3]; // 8位数据扩展为16位
+        wheel = (int8_t)data[4];
+      }
+      else if (length >= 4)
+      {
+        // 至少包含 Report ID + Buttons + X + Y
+        buttons = data[1];
+        x = (int16_t)(int8_t)data[2];
+        y = (int16_t)(int8_t)data[3];
+        wheel = 0; // 无滚轮数据
+      }
+      else
+      {
+        ESP_LOGW(TAG_MOUSE, "Report Protocol with ID 0x%02X too short: length=%d, expected at least 4 bytes", data[0], length);
+        return;
       }
     }
     else
     {
-      ESP_LOGW(TAG_MOUSE, "Report Protocol data too short after offset: len=%d, offset=%d", length, data_offset);
-      return;
+      // 不包含 Report ID 的格式：Buttons(1) + X(1) + Y(1) + Wheel(1)
+      if (length >= 4)
+      {
+        buttons = data[0];
+        x = (int16_t)(int8_t)data[1]; // 8位数据扩展为16位
+        y = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
+        wheel = (int8_t)data[3];
+      }
+      else if (length >= 3)
+      {
+        // 至少包含 Buttons + X + Y
+        buttons = data[0];
+        x = (int16_t)(int8_t)data[1];
+        y = (int16_t)(int8_t)data[2];
+        wheel = 0; // 无滚轮数据
+      }
+      else
+      {
+        ESP_LOGW(TAG_MOUSE, "Report Protocol without ID too short: length=%d, expected at least 3 bytes", length);
+        return;
+      }
     }
   }
 
-  // 构建BLE鼠标报告（4字节，macOS兼容格式）
+  // 构建BLE鼠标报告
+  // 修复错误：正确的数据布局应该是：
+  // 基于 Zephyr report map 格式（兼容 8bit 和 16bit）：
+  // [0]: buttons (1字节: 3位按钮 + 5位padding)
+  // [1-2]: X (16位 = 2字节, little-endian)
+  // [3-4]: Y (16位 = 2字节, little-endian)
+  // [5]: Wheel (8位 = 1字节)
+  // 总计：6字节 (48位)
   uint8_t ble_mouse_report[HID_MOUSE_IN_RPT_LEN] = {0};
-  ble_mouse_report[0] = buttons; // 按钮状态
-  ble_mouse_report[1] = x;       // X位移
-  ble_mouse_report[2] = y;       // Y位移
-  ble_mouse_report[3] = wheel;   // 滚轮
+
+  // ========================================================================
+  // Buttons 打包（参考 asterics 仓库逻辑）
+  // ========================================================================
+  // 只使用低3位（左、右、中键），高5位为padding（自动为0）
+  // 如果 use_layout 存在，直接使用 buttons_u；否则使用回退路径的 buttons
+  // ========================================================================
+  uint8_t buttons_3bit;
+  if (use_layout != NULL && use_layout->buttons_count > 0)
+  {
+    // 从 use_layout 路径：直接使用 buttons_u 的低3位
+    buttons_3bit = (uint8_t)(buttons_u & 0x07);
+  }
+  else
+  {
+    // 回退路径：使用 buttons 的低3位（回退逻辑中已设置）
+    buttons_3bit = buttons & 0x07;
+  }
+  ble_mouse_report[0] = buttons_3bit; // 按钮（3位）+ padding（5位，自动为0）
+
+  // ========================================================================
+  // 打包 BLE 鼠标报告（参考 asterics 仓库逻辑）
+  // ========================================================================
+  // 依赖类型转换自动处理，不进行显式 clamp
+  // 类型转换会自动处理溢出（截断到目标类型的范围）
+  // ========================================================================
+#if USE_16BIT_MOUSE_PRECISION
+  // 16位格式：发送完整的16位数据
+  // X位移（16位，little-endian）- 字节1-2
+  ble_mouse_report[1] = (uint8_t)(x & 0xFF);        // X低字节
+  ble_mouse_report[2] = (uint8_t)((x >> 8) & 0xFF); // X高字节
+
+  // Y位移（16位，little-endian）- 字节3-4
+  ble_mouse_report[3] = (uint8_t)(y & 0xFF);        // Y低字节
+  ble_mouse_report[4] = (uint8_t)((y >> 8) & 0xFF); // Y高字节
+
+  // Wheel（8位，有符号）- 字节5
+  ble_mouse_report[5] = (uint8_t)wheel; // 滚轮（类型转换自动处理）
+#else
+  // 8位格式：将8位数据放在16位字段的低8位，高8位为0（符号扩展）
+  // X位移（16位，little-endian）- 8位数据放在低8位
+  int16_t x_16 = (int16_t)(int8_t)x;                   // 符号扩展
+  ble_mouse_report[1] = (uint8_t)(x_16 & 0xFF);        // X低字节
+  ble_mouse_report[2] = (uint8_t)((x_16 >> 8) & 0xFF); // X高字节（符号位）
+
+  // Y位移（16位，little-endian）- 8位数据放在低8位
+  int16_t y_16 = (int16_t)(int8_t)y;                   // 符号扩展
+  ble_mouse_report[3] = (uint8_t)(y_16 & 0xFF);        // Y低字节
+  ble_mouse_report[4] = (uint8_t)((y_16 >> 8) & 0xFF); // Y高字节（符号位）
+
+  // Wheel（8位，有符号）- 字节5
+  ble_mouse_report[5] = (uint8_t)wheel; // 滚轮（类型转换自动处理）
+#endif
+
+  // 打印发送的数据用于手动校验
+  static bool first_print = true;
+
+  // 第一次打印时显示详细信息
+  if (first_print)
+  {
+    ESP_LOGI(TAG_MOUSE, "========== 鼠标数据发送格式 (基于 Zephyr report map) ==========");
+    ESP_LOGI(TAG_MOUSE, "USE_16BIT_MOUSE_PRECISION = %d", USE_16BIT_MOUSE_PRECISION);
+    ESP_LOGI(TAG_MOUSE, "HID_MOUSE_IN_RPT_LEN = %d 字节", HID_MOUSE_IN_RPT_LEN);
+    ESP_LOGI(TAG_MOUSE, "数据布局: [按钮(1)] [X低(1)] [X高(1)] [Y低(1)] [Y高(1)] [Wheel(1)]");
+    ESP_LOGI(TAG_MOUSE, "字节索引:   0        1       2       3       4       5");
+    ESP_LOGI(TAG_MOUSE, "字段说明: 按钮(3位+5位padding) + X(16位) + Y(16位) + Wheel(8位) = 6字节");
+    ESP_LOGI(TAG_MOUSE, "兼容性: X/Y 定义为 16bit，兼容 8bit 和 16bit 数据");
+    ESP_LOGI(TAG_MOUSE, "================================================================");
+    first_print = false;
+  }
+
+  // 每次有效移动时都打印（用于手动校验）
+  if (x != 0 || y != 0 || wheel != 0 || buttons != 0)
+  {
+    // 验证数据打包：检查buttons、X/Y的little-endian格式
+    uint8_t buttons_verify = ble_mouse_report[0] & 0x07; // 只取低3位
+    uint16_t x_le = (uint16_t)((ble_mouse_report[2] << 8) | ble_mouse_report[1]);
+    uint16_t y_le = (uint16_t)((ble_mouse_report[4] << 8) | ble_mouse_report[3]);
+    int16_t x_verify = (int16_t)x_le;
+    int16_t y_verify = (int16_t)y_le;
+
+    ESP_LOGI(TAG_MOUSE, "[发送数据] buttons=0x%02X(3bit), x=%d->%d(0x%04X), y=%d->%d(0x%04X), wheel=%d",
+             buttons_verify, (int)x, (int)x_verify, (unsigned int)x_le,
+             (int)y, (int)y_verify, (unsigned int)y_le, (int)wheel);
+
+    ESP_LOGI(TAG_MOUSE, "[原始字节] %02X %02X %02X %02X %02X %02X",
+             ble_mouse_report[0], ble_mouse_report[1], ble_mouse_report[2],
+             ble_mouse_report[3], ble_mouse_report[4], ble_mouse_report[5]);
+
+    ESP_LOGI(TAG_MOUSE, "[字段解析] 按钮[0]=0x%02X(3bit), X[1-2]=%d(0x%04X), Y[3-4]=%d(0x%04X), Wheel[5]=%d(0x%02X)",
+             buttons_verify,
+             (int)x_verify, (unsigned int)x_le,
+             (int)y_verify, (unsigned int)y_le,
+             (int)wheel, (unsigned int)ble_mouse_report[5]);
+  }
 
   // 发送到BLE HID设备
   // remember last buttons state for separated reports
   last_buttons = buttons;
   hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, HID_MOUSE_IN_RPT_LEN, ble_mouse_report);
 
-  // 调试输出（改为INFO级别以便观察）
-  if (buttons > 0 || x != 0 || y != 0 || wheel != 0)
-  {
-    ESP_LOGI(TAG_MOUSE, "Mouse: buttons=0x%02X, x=%d, y=%d, wheel=%d, len=%d, offset=%d", buttons, x, y, wheel, length, data_offset);
-  }
+  // 调试输出 - 已禁用以提高性能，仅在需要调试时启用
+  // if (buttons > 0 || x != 0 || y != 0 || wheel != 0)
+  // {
+  //   ESP_LOGD(TAG_MOUSE, "Mouse: buttons=0x%02X, x=%d, y=%d, wheel=%d, len=%d, offset=%d", buttons, x, y, wheel, length, data_offset);
+  // }
 }
 
 /**
@@ -754,8 +904,8 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
   hid_host_dev_params_t dev_params;
   ESP_ERROR_CHECK(hid_host_device_get_params(hid_device_handle, &dev_params));
 
-  putchar('\n');
-  ESP_LOGI(TAG_HID, "Interface: %d", dev_params.iface_num);
+  // putchar('\n');
+  // ESP_LOGI(TAG_HID, "Interface: %d", dev_params.iface_num);
 
   // size_t report_desc_len = 0;
   // uint8_t *report_desc = hid_host_get_report_descriptor(hid_device_handle, &report_desc_len);
@@ -799,16 +949,17 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
       // 鼠标：根据报告长度自动判断协议类型
       // Boot Protocol: 3字节（按钮+X+Y）
       // Report Protocol: 4字节或更多（可能包含滚轮、额外按钮等）
-      bool is_boot_protocol = (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class && data_length == 3);
 
-      if (is_boot_protocol)
-      {
-        ESP_LOGI(TAG_MOUSE, "Mouse Event (Boot Protocol, len=%d)", data_length);
-      }
-      else
-      {
-        ESP_LOGI(TAG_MOUSE, "Mouse Event (Report Protocol, len=%d)", data_length);
-      }
+      // 已禁用日志以提高性能
+      // bool is_boot_protocol = (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class && data_length == 3);
+      // if (is_boot_protocol)
+      // {
+      //   ESP_LOGD(TAG_MOUSE, "Mouse Event (Boot Protocol, len=%d)", data_length);
+      // }
+      // else
+      // {
+      //   ESP_LOGD(TAG_MOUSE, "Mouse Event (Report Protocol, len=%d)", data_length);
+      // }
       hid_host_mouse_report_callback(hid_device_handle, data, data_length);
     }
     else
@@ -843,6 +994,9 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
     else if (dev_params.proto == HID_PROTOCOL_MOUSE)
     {
       usb_hid_devices.mouse_handle = NULL;
+      // 清除layout缓存
+      g_cached_layout = NULL;
+      g_cached_report_id = 0xFF;
     }
 
     set_led_color();

@@ -6,7 +6,22 @@
 
 #include "hidd_le_prf_int.h"
 #include <string.h>
+#include <stdio.h>
 #include "esp_log.h"
+
+// 配置选项：使用16位精度（1）或8位精度（0）
+// 注意：Report Map 中 X/Y 定义为 16bit 以兼容 8bit 和 16bit
+// 如果 USE_16BIT_MOUSE_PRECISION=1，发送完整的 16bit 数据（5字节报告）
+// 如果 USE_16BIT_MOUSE_PRECISION=0，发送 8bit 数据但放在 16bit 字段中（仍为5字节报告）
+// 注意：此宏必须与esp_hidd_prf_api.c和hid_host_example.c中的定义保持一致
+#ifndef USE_16BIT_MOUSE_PRECISION
+#define USE_16BIT_MOUSE_PRECISION 1
+#endif
+
+// HID mouse input report length (必须与esp_hidd_prf_api.c和hid_host_example.c保持一致)
+// 基于 Zephyr report map: 按钮(1字节: 3位按钮+5位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
+// 注意：即使发送 8bit 数据，报告长度仍为 6 字节（8bit 数据放在 16bit 字段的低 8 位）
+#define HID_MOUSE_IN_RPT_LEN 6 // 按钮(1) + X(2) + Y(2) + Wheel(1) = 6字节（兼容 8bit 和 16bit）
 
 /// characteristic presentation information
 struct prf_char_pres_fmt
@@ -27,72 +42,28 @@ struct prf_char_pres_fmt
 static hid_report_map_t hid_rpt_map[HID_NUM_REPORTS];
 
 // HID Report Map characteristic value
-// Keyboard report descriptor (using format for Boot interface descriptor)
+// 新的 Report Map：兼容键盘和鼠标
+// Report ID 1: Keyboard
+// Report ID 2: Consumer Control
+// Report ID 3: Mouse (16-bit X/Y, 兼容 8bit 和 16bit)
+// Report ID 4: Gamepad (可选，通过 CONFIG_MODULE_USEJOYSTICK 控制)
 static const uint8_t hidReportMap[] = {
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x02, // Usage (Mouse)
-    0xA1, 0x01, // Collection (Application)
-    0x85, 0x01, // Report Id (1)
-    0x09, 0x01, //   Usage (Pointer)
-    0xA1, 0x00, //   Collection (Physical)
-    0x05, 0x09, //     Usage Page (Buttons)
-    0x19, 0x01, //     Usage Minimum (01) - Button 1
-    0x29, 0x03, //     Usage Maximum (03) - Button 3
-    0x15, 0x00, //     Logical Minimum (0)
-    0x25, 0x01, //     Logical Maximum (1)
-    0x75, 0x01, //     Report Size (1)
-    0x95, 0x03, //     Report Count (3)
-    0x81, 0x02, //     Input (Data, Variable, Absolute) - Button states
-    0x75, 0x05, //     Report Size (5)
-    0x95, 0x01, //     Report Count (1)
-    0x81, 0x01, //     Input (Constant) - Padding or Reserved bits
-    0x05, 0x01, //     Usage Page (Generic Desktop)
-    0x09, 0x30, //     Usage (X)
-    0x09, 0x31, //     Usage (Y)
-    0x09, 0x38, //     Usage (Wheel)
-    0x15, 0x81, //     Logical Minimum (-127)
-    0x25, 0x7F, //     Logical Maximum (127)
-    0x75, 0x08, //     Report Size (8)
-    0x95, 0x03, //     Report Count (3) - X, Y, Wheel (macOS要求连续定义)
-    0x81, 0x06, //     Input (Data, Variable, Relative) - X, Y & Wheel coordinate
-    0xC0,       //   End Collection
-    0xC0,       // End Collection
-
+    // ================= Keyboard (Report ID 1) =================
     0x05, 0x01, // Usage Pg (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
     0xA1, 0x01, // Collection: (Application)
-    0x85, 0x02, // Report Id (2)
-    //
+    0x85, 0x01, // Report Id (1)
+
     0x05, 0x07, //   Usage Pg (Key Codes)
     0x19, 0xE0, //   Usage Min (224)
     0x29, 0xE7, //   Usage Max (231)
     0x15, 0x00, //   Log Min (0)
     0x25, 0x01, //   Log Max (1)
-    //
-    //   Modifier byte
+
     0x75, 0x01, //   Report Size (1)
     0x95, 0x08, //   Report Count (8)
     0x81, 0x02, //   Input: (Data, Variable, Absolute)
-    //
-    //   Reserved byte
-    0x95, 0x01, //   Report Count (1)
-    0x75, 0x08, //   Report Size (8)
-    0x81, 0x01, //   Input: (Constant)
-    //
-    //   LED report
-    0x05, 0x08, //   Usage Pg (LEDs)
-    0x19, 0x01, //   Usage Min (1)
-    0x29, 0x05, //   Usage Max (5)
-    0x95, 0x05, //   Report Count (5)
-    0x75, 0x01, //   Report Size (1)
-    0x91, 0x02, //   Output: (Data, Variable, Absolute)
-    //
-    //   LED report padding
-    0x95, 0x01, //   Report Count (1)
-    0x75, 0x03, //   Report Size (3)
-    0x91, 0x01, //   Output: (Constant)
-    //
-    //   Key arrays (6 bytes)
+
     0x95, 0x06, //   Report Count (6)
     0x75, 0x08, //   Report Size (8)
     0x15, 0x00, //   Log Min (0)
@@ -101,92 +72,153 @@ static const uint8_t hidReportMap[] = {
     0x19, 0x00, //   Usage Min (0)
     0x29, 0x65, //   Usage Max (101)
     0x81, 0x00, //   Input: (Data, Array)
-    //
+
     0xC0, // End Collection
-    //
-    // 0x05, 0x0C, // Usage Pg (Consumer Devices)
-    // 0x09, 0x01, // Usage (Consumer Control)
-    // 0xA1, 0x01, // Collection (Application)
-    // 0x85, 0x03, // Report Id (3)
-    // 0x09, 0x02, //   Usage (Numeric Key Pad)
-    // 0xA1, 0x02, //   Collection (Logical)
-    // 0x05, 0x09, //     Usage Pg (Button)
-    // 0x19, 0x01, //     Usage Min (Button 1)
-    // 0x29, 0x0A, //     Usage Max (Button 10)
-    // 0x15, 0x01, //     Logical Min (1)
-    // 0x25, 0x0A, //     Logical Max (10)
-    // 0x75, 0x04, //     Report Size (4)
-    // 0x95, 0x01, //     Report Count (1)
-    // 0x81, 0x00, //     Input (Data, Ary, Abs)
-    // 0xC0,       //   End Collection
-    // 0x05, 0x0C, //   Usage Pg (Consumer Devices)
-    // 0x09, 0x86, //   Usage (Channel)
-    // 0x15, 0xFF, //   Logical Min (-1)
-    // 0x25, 0x01, //   Logical Max (1)
-    // 0x75, 0x02, //   Report Size (2)
-    // 0x95, 0x01, //   Report Count (1)
-    // 0x81, 0x46, //   Input (Data, Var, Rel, Null)
-    // 0x09, 0xE9, //   Usage (Volume Up)
-    // 0x09, 0xEA, //   Usage (Volume Down)
-    // 0x15, 0x00, //   Logical Min (0)
-    // 0x75, 0x01, //   Report Size (1)
-    // 0x95, 0x02, //   Report Count (2)
-    // 0x81, 0x02, //   Input (Data, Var, Abs)
-    // 0x09, 0xE2, //   Usage (Mute)
-    // 0x09, 0x30, //   Usage (Power)
-    // 0x09, 0x83, //   Usage (Recall Last)
-    // 0x09, 0x81, //   Usage (Assign Selection)
-    // 0x09, 0xB0, //   Usage (Play)
-    // 0x09, 0xB1, //   Usage (Pause)
-    // 0x09, 0xB2, //   Usage (Record)
-    // 0x09, 0xB3, //   Usage (Fast Forward)
-    // 0x09, 0xB4, //   Usage (Rewind)
-    // 0x09, 0xB5, //   Usage (Scan Next)
-    // 0x09, 0xB6, //   Usage (Scan Prev)
-    // 0x09, 0xB7, //   Usage (Stop)
-    // 0x15, 0x01, //   Logical Min (1)
-    // 0x25, 0x0C, //   Logical Max (12)
-    // 0x75, 0x04, //   Report Size (4)
-    // 0x95, 0x01, //   Report Count (1)
-    // 0x81, 0x00, //   Input (Data, Ary, Abs)
-    // 0x09, 0x80, //   Usage (Selection)
-    // 0xA1, 0x02, //   Collection (Logical)
-    // 0x05, 0x09, //     Usage Pg (Button)
-    // 0x19, 0x01, //     Usage Min (Button 1)
-    // 0x29, 0x03, //     Usage Max (Button 3)
-    // 0x15, 0x01, //     Logical Min (1)
-    // 0x25, 0x03, //     Logical Max (3)
-    // 0x75, 0x02, //     Report Size (2)
-    // 0x81, 0x00, //     Input (Data, Ary, Abs)
-    // 0xC0,       //   End Collection
-    // 0x81, 0x03, //   Input (Const, Var, Abs)
-    // 0xC0,       // End Collection
-    //
-    // Cosmic Byte Artermis Keyboard report
-    0x05, 0x0C,       // Usage Pg (Consumer)
-    0x09, 0x01,       // Usage (Consumer Control)
-    0xA1, 0x01,       // Collection (Application)
-    0x85, 0x03,       // Report Id (3)
-    0x19, 0x00,       // Usage Min (0)
-    0x2A, 0xff, 0x07, // Usage Max (0x07ff)
-    0x15, 0x00,       // Logical Min (0)
-    0x26, 0xff, 0x07, // Logical Max (0x07ff)
-    0x95, 0x01,       // Report Count (1)
-    0x75, 0x10,       // Report Size (16)
-    0x81, 0x00,       // Input (Data, Ary, Abs)
-    0xC0,             // End Collection
+
+    // ================= Consumer Control (Report ID 2) =================
+    0x05, 0x0C, // Usage Pg (Consumer Devices)
+    0x09, 0x01, // Usage (Consumer Control)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x02, // Report Id (2)
+
+    0x05, 0x0C, //   Usage Pg (Consumer Devices)
+    0x09, 0x86, //   Usage (Channel)
+    0x15, 0xFF, //   Logical Min (-1)
+    0x25, 0x01, //   Logical Max (1)
+    0x75, 0x02, //   Report Size (2)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x46, //   Input (Data, Var, Rel, Null)
+
+    0x09, 0xE9, //   Usage (Volume Up)
+    0x09, 0xEA, //   Usage (Volume Down)
+    0x15, 0x00, //   Logical Min (0)
+    0x75, 0x01, //   Report Size (1)
+    0x95, 0x02, //   Report Count (2)
+    0x81, 0x02, //   Input (Data, Var, Abs)
+
+    0x09, 0xE2, //   Usage (Mute)
+    0x09, 0x30, //   Usage (Power)
+    0x09, 0x83, //   Usage (Recall Last)
+    0x09, 0x81, //   Usage (Assign Selection)
+    0x09, 0xB0, //   Usage (Play)
+    0x09, 0xB1, //   Usage (Pause)
+    0x09, 0xB2, //   Usage (Record)
+    0x09, 0xB3, //   Usage (Fast Forward)
+    0x09, 0xB4, //   Usage (Rewind)
+    0x09, 0xB5, //   Usage (Scan Next)
+    0x09, 0xB6, //   Usage (Scan Prev)
+    0x09, 0xB7, //   Usage (Stop)
+    0x15, 0x01, //   Logical Min (1)
+    0x25, 0x0C, //   Logical Max (12)
+    0x75, 0x04, //   Report Size (4)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x00, //   Input (Data, Ary, Abs)
+
+    0xC0, // End Collection
+
+    // ================= Mouse (Report ID 3) =================
+    0x05, 0x01, // Usage Page (Generic Desktop)
+    0x09, 0x02, // Usage (Mouse)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x03, // Report Id (3)
+
+    0x09, 0x01, //   Usage (Pointer)
+    0xA1, 0x00, //   Collection (Physical)
+
+    // Buttons (3 bits)
+    0x05, 0x09, //     Usage Page (Buttons)
+    0x19, 0x01, //     Usage Minimum (01) - Button 1
+    0x29, 0x03, //     Usage Maximum (03) - Button 3
+    0x15, 0x00, //     Logical Minimum (0)
+    0x25, 0x01, //     Logical Maximum (1)
+    0x75, 0x01, //     Report Size (1)
+    0x95, 0x03, //     Report Count (3)
+    0x81, 0x02, //     Input (Data, Variable, Absolute)
+
+    // Padding (5 bits)
+    0x75, 0x05, //     Report Size (5)
+    0x95, 0x01, //     Report Count (1)
+    0x81, 0x01, //     Input (Constant)
+
+    // X/Y 16-bit signed: -32768..32767 (兼容 8bit 和 16bit)
+    0x05, 0x01,       //     Usage Page (Generic Desktop)
+    0x09, 0x30,       //     Usage (X)
+    0x09, 0x31,       //     Usage (Y)
+    0x16, 0x00, 0x80, //     Logical Minimum (-32768)
+    0x26, 0xFF, 0x7F, //     Logical Maximum (32767)
+    0x75, 0x10,       //     Report Size (16)
+    0x95, 0x02,       //     Report Count (2)  -> X,Y
+    0x81, 0x06,       //     Input (Data, Variable, Relative)
+
+    // Wheel 8-bit signed: -127..127
+    0x05, 0x01, //     Usage Page (Generic Desktop) - 确保 Usage Page 正确
+    0x09, 0x38, //     Usage (Wheel)
+    0x15, 0x81, //     Logical Minimum (-127)
+    0x25, 0x7F, //     Logical Maximum (127)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x01, //     Report Count (1)
+    0x81, 0x06, //     Input (Data, Variable, Relative)
+
+    0xC0, //   End Collection
+    0xC0, // End Collection
+
+#if defined(CONFIG_MODULE_USEJOYSTICK) && CONFIG_MODULE_USEJOYSTICK
+    // ================= Gamepad (Report ID 4) =================
+    0x05, 0x01, // Usage Page (Generic Desktop)
+    0x09, 0x05, // Usage (Gamepad)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x04, // Report Id (4)
+
+    0x05, 0x01,
+    0x09, 0x30,
+    0x09, 0x31,
+    0x09, 0x32,
+    0x09, 0x35,
+    0x09, 0x33,
+    0x09, 0x34,
+    0x15, 0x81,
+    0x25, 0x7F,
+    0x95, 0x06,
+    0x75, 0x08,
+    0x81, 0x02,
+
+    0x05, 0x01,
+    0x09, 0x39,
+    0x15, 0x01,
+    0x25, 0x08,
+    0x35, 0x00,
+    0x46, 0x3B, 0x01,
+    0x95, 0x01,
+    0x75, 0x08,
+    0x81, 0x02,
+
+    0x05, 0x09,
+    0x19, 0x01,
+    0x29, 0x20,
+    0x15, 0x00,
+    0x25, 0x01,
+    0x95, 0x20,
+    0x75, 0x01,
+    0x81, 0x02,
+
+    0xC0, // End Collection
+#endif
 
 #if (SUPPORT_REPORT_VENDOR == true)
     0x06, 0xFF, 0xFF, // Usage Page(Vendor defined)
     0x09, 0xA5,       // Usage(Vendor Defined)
     0xA1, 0x01,       // Collection(Application)
-    0x85, 0x04,       // Report Id (4)
-    0x09, 0xA6,       // Usage(Vendor defined)
-    0x09, 0xA9,       // Usage(Vendor defined)
-    0x75, 0x08,       // Report Size
-    0x95, 0x7F,       // Report Count = 127 Btyes
-    0x91, 0x02,       // Output(Data, Variable, Absolute)
-    0xC0,             // End Collection
+#if defined(CONFIG_MODULE_USEJOYSTICK) && CONFIG_MODULE_USEJOYSTICK
+    0x85, 0x05, // Report Id (5) - Gamepad 使用 4，Vendor 使用 5
+#else
+    0x85, 0x04, // Report Id (4) - 如果没有 Gamepad，Vendor 使用 4
+#endif
+    0x09, 0xA6, // Usage(Vendor defined)
+    0x09, 0xA9, // Usage(Vendor defined)
+    0x75, 0x08, // Report Size
+    0x95, 0x7F, // Report Count = 127 Btyes
+    0x91, 0x02, // Output(Data, Variable, Absolute)
+    0xC0,       // End Collection
 #endif
 
 };
@@ -524,6 +556,56 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
       memcpy(hidd_le_env.hidd_inst.att_tbl, param->add_attr_tab.handles,
              HIDD_LE_IDX_NB * sizeof(uint16_t));
       ESP_LOGI(HID_LE_PRF_TAG, "hid svc handle = %x", hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_SVC]);
+
+      // 打印HID Report Map用于手动校验
+      ESP_LOGI(HID_LE_PRF_TAG, "========== HID Report Map (长度: %d 字节) ==========", hidReportMapLen);
+      ESP_LOGI(HID_LE_PRF_TAG, "USE_16BIT_MOUSE_PRECISION = %d", USE_16BIT_MOUSE_PRECISION);
+      ESP_LOGI(HID_LE_PRF_TAG, "HID_MOUSE_IN_RPT_LEN = %d 字节", HID_MOUSE_IN_RPT_LEN);
+
+      // 打印Report Map的十六进制数据（每行16字节）
+      for (int i = 0; i < hidReportMapLen; i += 16)
+      {
+        int len = (hidReportMapLen - i < 16) ? (hidReportMapLen - i) : 16;
+        char hex_str[64] = {0};
+        char ascii_str[17] = {0};
+
+        for (int j = 0; j < len; j++)
+        {
+          sprintf(hex_str + j * 3, "%02X ", hidReportMap[i + j]);
+          ascii_str[j] = (hidReportMap[i + j] >= 32 && hidReportMap[i + j] < 127) ? hidReportMap[i + j] : '.';
+        }
+        ascii_str[len] = '\0';
+        ESP_LOGI(HID_LE_PRF_TAG, "[%04X] %-48s | %s", i, hex_str, ascii_str);
+      }
+
+      // 解析并打印关键字段信息
+      ESP_LOGI(HID_LE_PRF_TAG, "========== Report Map 字段解析 ==========");
+      ESP_LOGI(HID_LE_PRF_TAG, "Report ID 分配:");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Report ID 1: Keyboard (8字节: Modifier + Reserved + 6 Keys)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Report ID 2: Consumer Control");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Report ID 3: Mouse");
+#if defined(CONFIG_MODULE_USEJOYSTICK) && CONFIG_MODULE_USEJOYSTICK
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Report ID 4: Gamepad (已启用)");
+#endif
+#if (SUPPORT_REPORT_VENDOR == true)
+#if defined(CONFIG_MODULE_USEJOYSTICK) && CONFIG_MODULE_USEJOYSTICK
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Report ID 5: Vendor Output (已启用)");
+#else
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Report ID 4: Vendor Output (已启用)");
+#endif
+#endif
+      ESP_LOGI(HID_LE_PRF_TAG, "鼠标报告结构 (Report ID 3):");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - 按钮: 3位 (左、右、中键) + 5位padding = 1字节 (字节0)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - X: 16位 = 2字节 (字节1-2, little-endian, 兼容 8bit 和 16bit)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Y: 16位 = 2字节 (字节3-4, little-endian, 兼容 8bit 和 16bit)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - Wheel: 8位 = 1字节 (字节5)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - 总计: 6字节 (48位)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - USE_16BIT_MOUSE_PRECISION = %d (发送 %s 数据)",
+               USE_16BIT_MOUSE_PRECISION,
+               USE_16BIT_MOUSE_PRECISION ? "16bit" : "8bit (放在16bit字段中)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - 注意：发送 Mouse Report 时，X/Y 需要按 int16_t 小端格式发送");
+      ESP_LOGI(HID_LE_PRF_TAG, "==========================================");
+
       hid_add_id_tbl();
       esp_ble_gatts_start_service(hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_SVC]);
     }
@@ -674,7 +756,8 @@ static void hid_add_id_tbl(void)
   hid_rpt_map[0].id = hidReportRefMouseIn[0];
   hid_rpt_map[0].type = hidReportRefMouseIn[1];
   hid_rpt_map[0].handle = hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_VAL];
-  hid_rpt_map[0].cccdHandle = hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_VAL];
+  // hid_rpt_map[0].cccdHandle = hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_VAL];
+  hid_rpt_map[0].cccdHandle = hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_CCC];
   hid_rpt_map[0].mode = HID_PROTOCOL_MODE_REPORT;
 
   // Key input report
