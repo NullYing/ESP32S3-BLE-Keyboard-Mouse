@@ -36,6 +36,7 @@
 
 #include "hid_dev.h"
 #include "hid_report_parser_c.h"
+#include "hid_device_type_detector.h"
 
 #include "led_strip.h"
 
@@ -720,13 +721,6 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   }
 
   // 构建BLE鼠标报告
-  // 修复错误：正确的数据布局应该是：
-  // 基于 Zephyr report map 格式（兼容 8bit 和 16bit）：
-  // [0]: buttons (1字节: 3位按钮 + 5位padding)
-  // [1-2]: X (16位 = 2字节, little-endian)
-  // [3-4]: Y (16位 = 2字节, little-endian)
-  // [5]: Wheel (8位 = 1字节)
-  // 总计：6字节 (48位)
   uint8_t ble_mouse_report[HID_MOUSE_IN_RPT_LEN] = {0};
 
   // ========================================================================
@@ -781,22 +775,6 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   // Wheel（8位，有符号）- 字节5
   ble_mouse_report[5] = (uint8_t)wheel; // 滚轮（类型转换自动处理）
 #endif
-
-  // 打印发送的数据用于手动校验（仅第一次打印格式说明，已禁用以提高性能）
-  // static bool first_print = true;
-  // if (first_print)
-  // {
-  //   ESP_LOGI(TAG_MOUSE, "========== 鼠标数据发送格式 (基于 Zephyr report map) ==========");
-  //   ESP_LOGI(TAG_MOUSE, "USE_16BIT_MOUSE_PRECISION = %d", USE_16BIT_MOUSE_PRECISION);
-  //   ESP_LOGI(TAG_MOUSE, "HID_MOUSE_IN_RPT_LEN = %d 字节", HID_MOUSE_IN_RPT_LEN);
-  //   ESP_LOGI(TAG_MOUSE, "数据布局: [按钮(1)] [X低(1)] [X高(1)] [Y低(1)] [Y高(1)] [Wheel(1)]");
-  //   ESP_LOGI(TAG_MOUSE, "字节索引:   0        1       2       3       4       5");
-  //   ESP_LOGI(TAG_MOUSE, "字段说明: 按钮(3位+5位padding) + X(16位) + Y(16位) + Wheel(8位) = 6字节");
-  //   ESP_LOGI(TAG_MOUSE, "兼容性: X/Y 定义为 16bit，兼容 8bit 和 16bit 数据");
-  //   ESP_LOGI(TAG_MOUSE, "================================================================");
-  //   first_print = false;
-  // }
-
   // 每次有效移动时的详细日志已禁用以提高鼠标回报率性能
   // if (x != 0 || y != 0 || wheel != 0 || buttons != 0)
   // {
@@ -1040,15 +1018,63 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
     }
     // 非Boot Interface设备默认使用Report Protocol，无需设置
 
-    // 根据协议类型注册设备
-    if (HID_PROTOCOL_KEYBOARD == dev_params.proto)
+    // 根据协议类型和Report Descriptor验证设备类型
+    // 优先使用Report Descriptor检测，因为它更准确
+    bool is_keyboard_from_desc = false;
+    bool is_mouse_from_desc = false;
+    bool desc_check_success = hid_device_type_detect(hid_device_handle, &is_keyboard_from_desc, &is_mouse_from_desc);
+
+    // 决定设备类型：优先使用Descriptor检测结果，如果失败则回退到协议字段
+    bool should_register_as_keyboard = false;
+    bool should_register_as_mouse = false;
+
+    if (desc_check_success)
+    {
+      // 使用Descriptor检测结果
+      should_register_as_keyboard = is_keyboard_from_desc && !is_mouse_from_desc;
+      should_register_as_mouse = is_mouse_from_desc;
+
+      if (is_keyboard_from_desc && is_mouse_from_desc)
+      {
+        // 如果同时检测到键盘和鼠标，优先使用协议字段
+        ESP_LOGW(TAG_HID, "设备同时包含键盘和鼠标功能，使用协议字段判断");
+        should_register_as_keyboard = (HID_PROTOCOL_KEYBOARD == dev_params.proto);
+        should_register_as_mouse = (HID_PROTOCOL_MOUSE == dev_params.proto);
+      }
+    }
+    else
+    {
+      // Descriptor检测失败，回退到协议字段
+      should_register_as_keyboard = (HID_PROTOCOL_KEYBOARD == dev_params.proto);
+      should_register_as_mouse = (HID_PROTOCOL_MOUSE == dev_params.proto);
+    }
+
+    // 如果Descriptor检测结果与协议字段不一致，记录警告
+    if (desc_check_success)
+    {
+      if (is_mouse_from_desc && HID_PROTOCOL_KEYBOARD == dev_params.proto)
+      {
+        ESP_LOGW(TAG_HID, "警告：协议字段显示为键盘，但Report Descriptor检测为鼠标，将注册为鼠标");
+        should_register_as_keyboard = false;
+        should_register_as_mouse = true;
+      }
+      else if (is_keyboard_from_desc && HID_PROTOCOL_MOUSE == dev_params.proto)
+      {
+        ESP_LOGW(TAG_HID, "警告：协议字段显示为鼠标，但Report Descriptor检测为键盘，将注册为键盘");
+        should_register_as_keyboard = true;
+        should_register_as_mouse = false;
+      }
+    }
+
+    // 注册设备
+    if (should_register_as_keyboard)
     {
       ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
       // 保存键盘设备句柄
       usb_hid_devices.keyboard_handle = hid_device_handle;
       ESP_LOGI(TAG_KEYBOARD, "键盘设备已注册");
     }
-    else if (HID_PROTOCOL_MOUSE == dev_params.proto)
+    else if (should_register_as_mouse)
     {
       ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
       // 保存鼠标设备句柄
@@ -1061,19 +1087,7 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
 
       if (report_desc != NULL && report_desc_len > 0)
       {
-        ESP_LOGI(TAG_MOUSE, "=========================================");
-        ESP_LOGI(TAG_MOUSE, "鼠标 HID Report Descriptor (长度: %zu 字节):", report_desc_len);
-        ESP_LOGI(TAG_MOUSE, "=========================================");
-        // 打印原始十六进制数据
-        for (size_t i = 0; i < report_desc_len; i++)
-        {
-          printf("%02X ", report_desc[i]);
-          // 每16字节换行，便于阅读
-          if ((i + 1) % 16 == 0)
-          {
-            putchar('\n');
-          }
-        }
+
         if (report_desc_len % 16 != 0)
         {
           putchar('\n');

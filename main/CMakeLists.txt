@@ -5,6 +5,7 @@ idf_component_register(
   "hid_dev.c"
   "hid_device_le_prf.c"
   "hid_report_parser.c"
+  "hid_device_type_detector.c"
   INCLUDE_DIRS
   "."
   PRIV_REQUIRES

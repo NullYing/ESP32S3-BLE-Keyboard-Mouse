@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include "esp_log.h"
+#include "hidd_le_prf_int.h" // 包含HID_RPT_ID_MOUSE_IN和HID_REPORT_TYPE_INPUT定义
 
 static hid_report_map_t *hid_dev_rpt_tbl;
 static uint8_t hid_dev_rpt_tbl_Len;
