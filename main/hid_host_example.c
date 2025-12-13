@@ -13,6 +13,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_hidd_prf_api.h"
@@ -37,6 +38,8 @@
 #include "hid_dev.h"
 #include "hid_report_parser_c.h"
 #include "hid_device_type_detector.h"
+#include "hid_host_example.h"
+#include "mouse_accumulator.h"
 
 #include "led_strip.h"
 
@@ -201,6 +204,28 @@ led_strip_handle_t led_strip;
 static const char *TAG_LED = "LED";
 
 /* =================================================================================================
+   辅助函数：供 mouse_accumulator 模块调用
+   ================================================================================================= */
+
+/**
+ * @brief 检查BLE是否已连接
+ */
+bool mouse_accumulator_is_ble_connected(void)
+{
+  return sec_conn;
+}
+
+/**
+ * @brief 通过BLE发送鼠标报告
+ */
+esp_err_t mouse_accumulator_send_ble_report(const uint8_t *report, uint8_t length)
+{
+  return hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id,
+                             HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT,
+                             length, (uint8_t *)report);
+}
+
+/* =================================================================================================
    FUNCTION PROTOTYPES
    ================================================================================================= */
 
@@ -275,6 +300,10 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
   {
     sec_conn = false;
     ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_DISCONNECT");
+
+    // 清理鼠标累加器（避免断线重连后发送旧数据）
+    mouse_accumulator_clear();
+
     esp_ble_gap_start_advertising(&ble_hid_adv_params);
     set_led_color();
     break;
@@ -720,92 +749,33 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
     }
   }
 
-  // 构建BLE鼠标报告
-  uint8_t ble_mouse_report[HID_MOUSE_IN_RPT_LEN] = {0};
+  // ========================================================================
+  // 新方案：只累加数据到累加器，不直接发送BLE
+  // BLE发送由定时器节拍触发，实现USB输入和BLE发送的彻底解耦
+  // ========================================================================
 
-  // ========================================================================
-  // Buttons 打包（参考 asterics 仓库逻辑）
-  // ========================================================================
-  // 只使用低3位（左、右、中键），高5位为padding（自动为0）
-  // 如果 use_layout 存在，直接使用 buttons_u；否则使用回退路径的 buttons
-  // ========================================================================
-  uint8_t buttons_3bit;
+  // 确定最终的按钮值（取低3位）
+  uint8_t buttons_final;
   if (use_layout != NULL && use_layout->buttons_count > 0)
   {
     // 从 use_layout 路径：直接使用 buttons_u 的低3位
-    buttons_3bit = (uint8_t)(buttons_u & 0x07);
+    buttons_final = (uint8_t)(buttons_u & 0x07);
   }
   else
   {
-    // 回退路径：使用 buttons 的低3位（回退逻辑中已设置）
-    buttons_3bit = buttons & 0x07;
+    // 回退路径：使用 buttons 的低3位
+    buttons_final = buttons & 0x07;
   }
-  ble_mouse_report[0] = buttons_3bit; // 按钮（3位）+ padding（5位，自动为0）
 
-  // ========================================================================
-  // 打包 BLE 鼠标报告（参考 asterics 仓库逻辑）
-  // ========================================================================
-  // 依赖类型转换自动处理，不进行显式 clamp
-  // 类型转换会自动处理溢出（截断到目标类型的范围）
-  // ========================================================================
-#if USE_16BIT_MOUSE_PRECISION
-  // 16位格式：发送完整的16位数据
-  // X位移（16位，little-endian）- 字节1-2
-  ble_mouse_report[1] = (uint8_t)(x & 0xFF);        // X低字节
-  ble_mouse_report[2] = (uint8_t)((x >> 8) & 0xFF); // X高字节
+  // 累加到全局累加器（线程安全）
+  mouse_accumulator_add(x, y, wheel, buttons_final);
 
-  // Y位移（16位，little-endian）- 字节3-4
-  ble_mouse_report[3] = (uint8_t)(y & 0xFF);        // Y低字节
-  ble_mouse_report[4] = (uint8_t)((y >> 8) & 0xFF); // Y高字节
+  // 保存按钮状态供下次比较
+  last_buttons = buttons_final;
 
-  // Wheel（8位，有符号）- 字节5
-  ble_mouse_report[5] = (uint8_t)wheel; // 滚轮（类型转换自动处理）
-#else
-  // 8位格式：将8位数据放在16位字段的低8位，高8位为0（符号扩展）
-  // X位移（16位，little-endian）- 8位数据放在低8位
-  int16_t x_16 = (int16_t)(int8_t)x;                   // 符号扩展
-  ble_mouse_report[1] = (uint8_t)(x_16 & 0xFF);        // X低字节
-  ble_mouse_report[2] = (uint8_t)((x_16 >> 8) & 0xFF); // X高字节（符号位）
-
-  // Y位移（16位，little-endian）- 8位数据放在低8位
-  int16_t y_16 = (int16_t)(int8_t)y;                   // 符号扩展
-  ble_mouse_report[3] = (uint8_t)(y_16 & 0xFF);        // Y低字节
-  ble_mouse_report[4] = (uint8_t)((y_16 >> 8) & 0xFF); // Y高字节（符号位）
-
-  // Wheel（8位，有符号）- 字节5
-  ble_mouse_report[5] = (uint8_t)wheel; // 滚轮（类型转换自动处理）
-#endif
-  // 每次有效移动时的详细日志已禁用以提高鼠标回报率性能
-  // if (x != 0 || y != 0 || wheel != 0 || buttons != 0)
-  // {
-  //   uint8_t buttons_verify = ble_mouse_report[0] & 0x07;
-  //   uint16_t x_le = (uint16_t)((ble_mouse_report[2] << 8) | ble_mouse_report[1]);
-  //   uint16_t y_le = (uint16_t)((ble_mouse_report[4] << 8) | ble_mouse_report[3]);
-  //   int16_t x_verify = (int16_t)x_le;
-  //   int16_t y_verify = (int16_t)y_le;
-  //   ESP_LOGI(TAG_MOUSE, "[发送数据] buttons=0x%02X(3bit), x=%d->%d(0x%04X), y=%d->%d(0x%04X), wheel=%d",
-  //            buttons_verify, (int)x, (int)x_verify, (unsigned int)x_le,
-  //            (int)y, (int)y_verify, (unsigned int)y_le, (int)wheel);
-  //   ESP_LOGI(TAG_MOUSE, "[原始字节] %02X %02X %02X %02X %02X %02X",
-  //            ble_mouse_report[0], ble_mouse_report[1], ble_mouse_report[2],
-  //            ble_mouse_report[3], ble_mouse_report[4], ble_mouse_report[5]);
-  //   ESP_LOGI(TAG_MOUSE, "[字段解析] 按钮[0]=0x%02X(3bit), X[1-2]=%d(0x%04X), Y[3-4]=%d(0x%04X), Wheel[5]=%d(0x%02X)",
-  //            buttons_verify,
-  //            (int)x_verify, (unsigned int)x_le,
-  //            (int)y_verify, (unsigned int)y_le,
-  //            (int)wheel, (unsigned int)ble_mouse_report[5]);
-  // }
-
-  // 发送到BLE HID设备
-  // remember last buttons state for separated reports
-  last_buttons = buttons;
-  hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, HID_MOUSE_IN_RPT_LEN, ble_mouse_report);
-
-  // 调试输出 - 已禁用以提高性能，仅在需要调试时启用
-  // if (buttons > 0 || x != 0 || y != 0 || wheel != 0)
-  // {
-  //   ESP_LOGD(TAG_MOUSE, "Mouse: buttons=0x%02X, x=%d, y=%d, wheel=%d, len=%d, offset=%d", buttons, x, y, wheel, length, data_offset);
-  // }
+  // 注释：原来的直接发送代码已移除
+  // 现在所有的BLE发送都在 ble_try_send_mouse() 中完成
+  // 该函数由定时器按固定节拍调用，确保发送速率稳定
 }
 
 /**
@@ -1440,6 +1410,9 @@ void app_main(void)
 
   led_strip = configure_led();
   set_led_color();
+
+  // 初始化鼠标累加器模块（创建BLE发送定时器）
+  ESP_ERROR_CHECK(mouse_accumulator_init());
 
   TickType_t last_heartbeat = xTaskGetTickCount();
   const TickType_t heartbeat_interval = pdMS_TO_TICKS(5000); // 5秒心跳

@@ -234,8 +234,8 @@ extern "C"
 
   void hid_dev_register_reports(uint8_t num_reports, hid_report_map_t *p_report);
 
-  void hid_dev_send_report(esp_gatt_if_t gatts_if, uint16_t conn_id,
-                           uint8_t id, uint8_t type, uint8_t length, uint8_t *data);
+  esp_err_t hid_dev_send_report(esp_gatt_if_t gatts_if, uint16_t conn_id,
+                                uint8_t id, uint8_t type, uint8_t length, uint8_t *data);
 
   void hid_consumer_build_report(uint8_t *buffer, consumer_cmd_t cmd);
 
