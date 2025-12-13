@@ -55,6 +55,28 @@ esp_err_t hid_dev_send_report(esp_gatt_if_t gatts_if, uint16_t conn_id,
   // get att handle for report
   if ((p_rpt = hid_dev_rpt_by_id(id, type)) != NULL)
   {
+    // 检查通知是否已启用（通过读取CCCD值）
+    // 如果CCCD handle为0，说明是输出报告或特征报告，不需要检查通知
+    if (p_rpt->cccdHandle != 0)
+    {
+      uint16_t cccd_len = 0;
+      const uint8_t *cccd_value_ptr = NULL;
+      esp_err_t get_ret = esp_ble_gatts_get_attr_value(p_rpt->cccdHandle, &cccd_len, &cccd_value_ptr);
+
+      // 如果无法获取CCCD值，或者通知未启用（CCCD值不等于0x0001），则返回错误
+      if (get_ret != ESP_OK || cccd_len < sizeof(uint16_t))
+      {
+        return ESP_ERR_INVALID_STATE; // 无法获取CCCD值或通知未启用
+      }
+
+      // 读取CCCD值（little-endian）
+      uint16_t cccd_value = cccd_value_ptr[0] | (cccd_value_ptr[1] << 8);
+      if ((cccd_value & 0x0001) == 0)
+      {
+        return ESP_ERR_INVALID_STATE; // 通知未启用
+      }
+    }
+
     // if notifications are enabled
     ESP_LOGD(HID_LE_PRF_TAG, "%s(), send the report, handle = %d", __func__, p_rpt->handle);
     esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, p_rpt->handle, length, data, false);

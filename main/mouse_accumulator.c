@@ -221,7 +221,16 @@ void mouse_accumulator_try_send(void)
   // 如果发送失败，回滚数据到累加器
   if (ret != ESP_OK)
   {
-    ESP_LOGW(TAG, "BLE发送失败 (错误: %s)，回滚数据到累加器", esp_err_to_name(ret));
+    // 对于通知未启用的情况，不记录警告（这是正常状态）
+    // 对于其他错误（如队列满），记录警告
+    if (ret != ESP_ERR_INVALID_STATE)
+    {
+      ESP_LOGW(TAG, "BLE发送失败 (错误: %s)，回滚数据到累加器", esp_err_to_name(ret));
+    }
+    else
+    {
+      ESP_LOGI(TAG, "BLE发送失败 (错误: %s)，回滚数据到累加器", esp_err_to_name(ret));
+    }
 
     portENTER_CRITICAL(&g_accumulator.spinlock);
     {

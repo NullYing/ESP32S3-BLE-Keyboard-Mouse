@@ -67,7 +67,7 @@
 // 因此如果 report_id 存在，需要调整 8 位以跳过 report_id
 #define HID_REPORT_ID_SIZE_BITS 8 // Report ID 的位宽（1 字节 = 8 位）
 
-#define LED_GPIO_PIN 21
+#define LED_GPIO_PIN 48
 #define LED_RMT_RES_HZ (10 * 1000 * 1000)
 #define LED_BRIGHTNESS 25
 
