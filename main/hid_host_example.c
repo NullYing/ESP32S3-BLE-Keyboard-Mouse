@@ -40,8 +40,7 @@
 #include "hid_device_type_detector.h"
 #include "hid_host_example.h"
 #include "mouse_accumulator.h"
-
-#include "led_strip.h"
+#include "led_control.h"
 
 /* =================================================================================================
    MACROS
@@ -66,10 +65,6 @@
 // Parser 返回的 bit_offset 是相对于报告数据开始（不包括 report_id）的
 // 因此如果 report_id 存在，需要调整 8 位以跳过 report_id
 #define HID_REPORT_ID_SIZE_BITS 8 // Report ID 的位宽（1 字节 = 8 位）
-
-#define LED_GPIO_PIN 48
-#define LED_RMT_RES_HZ (10 * 1000 * 1000)
-#define LED_BRIGHTNESS 25
 
 /* =================================================================================================
    VARIABLES, STRUCTS, ENUMS
@@ -198,10 +193,8 @@ static int g_mouse_layout_count = 0;
 static hid_report_layout_t *g_cached_layout = NULL;
 static uint8_t g_cached_report_id = 0xFF; // 0xFF表示未缓存
 
-// LED
-led_strip_handle_t led_strip;
-
-static const char *TAG_LED = "LED";
+// LED控制
+static led_strip_handle_t led_strip = NULL;
 
 /* =================================================================================================
    辅助函数：供 mouse_accumulator 模块调用
@@ -250,9 +243,8 @@ void usb_hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
                                   void *arg);
 static void print_usb_device_info(hid_host_device_handle_t hid_device_handle);
 
-// LED
-led_strip_handle_t configure_led(void);
-void set_led_color();
+// LED控制辅助函数
+static void update_led_color(void);
 
 /* =================================================================================================
    BLE HID
@@ -305,7 +297,7 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
     mouse_accumulator_clear();
 
     esp_ble_gap_start_advertising(&ble_hid_adv_params);
-    set_led_color();
+    update_led_color();
     break;
   }
   case ESP_HIDD_EVENT_BLE_VENDOR_REPORT_WRITE_EVT:
@@ -361,7 +353,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
     else
     {
-      set_led_color();
+      update_led_color();
     }
     break;
   case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
@@ -882,7 +874,38 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
   uint8_t data[64] = {0};
   size_t data_length = 0;
   hid_host_dev_params_t dev_params;
-  ESP_ERROR_CHECK(hid_host_device_get_params(hid_device_handle, &dev_params));
+
+  // 对于断开事件，即使获取参数失败也要处理
+  esp_err_t ret = hid_host_device_get_params(hid_device_handle, &dev_params);
+  if (ret != ESP_OK && event != HID_HOST_INTERFACE_EVENT_DISCONNECTED)
+  {
+    ESP_LOGE(TAG_HID, "获取HID设备参数失败: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  // 对于断开事件，如果获取参数失败，尝试通过句柄匹配来清理
+  if (ret != ESP_OK && event == HID_HOST_INTERFACE_EVENT_DISCONNECTED)
+  {
+    ESP_LOGW(TAG_USB, "获取HID设备参数失败（设备可能已断开）: %s，尝试通过句柄清理", esp_err_to_name(ret));
+    // 通过句柄匹配来清理设备
+    if (usb_hid_devices.keyboard_handle == hid_device_handle)
+    {
+      usb_hid_devices.keyboard_handle = NULL;
+      ESP_LOGI(TAG_KEYBOARD, "键盘设备句柄已清除（接口断开，通过句柄匹配）");
+    }
+    if (usb_hid_devices.mouse_handle == hid_device_handle)
+    {
+      usb_hid_devices.mouse_handle = NULL;
+      g_cached_layout = NULL;
+      g_cached_report_id = 0xFF;
+      g_mouse_layout_count = 0;
+      ESP_LOGI(TAG_MOUSE, "鼠标设备句柄已清除（接口断开，通过句柄匹配）");
+    }
+    // 尝试关闭设备（可能会失败，但这是正常的）
+    hid_host_device_close(hid_device_handle);
+    update_led_color();
+    return;
+  }
 
   // putchar('\n');
   // ESP_LOGI(TAG_HID, "Interface: %d", dev_params.iface_num);
@@ -964,22 +987,44 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
     ESP_LOGI(TAG_USB, "  接口号: %d", dev_params.iface_num);
     ESP_LOGI(TAG_USB, "  协议: %s", hid_proto_name_str[dev_params.proto]);
     ESP_LOGI(TAG_USB, "=========================================");
-    ESP_ERROR_CHECK(hid_host_device_close(hid_device_handle));
 
-    // 从设备列表中移除对应的设备
+    // 从设备列表中移除对应的设备（在关闭之前）
+    // 注意：需要检查句柄是否匹配，避免清除错误的设备
     if (dev_params.proto == HID_PROTOCOL_KEYBOARD)
     {
-      usb_hid_devices.keyboard_handle = NULL;
+      if (usb_hid_devices.keyboard_handle == hid_device_handle)
+      {
+        usb_hid_devices.keyboard_handle = NULL;
+        ESP_LOGI(TAG_KEYBOARD, "键盘设备句柄已清除（接口断开）");
+      }
     }
     else if (dev_params.proto == HID_PROTOCOL_MOUSE)
     {
-      usb_hid_devices.mouse_handle = NULL;
-      // 清除layout缓存
-      g_cached_layout = NULL;
-      g_cached_report_id = 0xFF;
+      if (usb_hid_devices.mouse_handle == hid_device_handle)
+      {
+        usb_hid_devices.mouse_handle = NULL;
+        // 清除layout缓存
+        g_cached_layout = NULL;
+        g_cached_report_id = 0xFF;
+        g_mouse_layout_count = 0; // 清除所有layout
+        ESP_LOGI(TAG_MOUSE, "鼠标设备句柄已清除（接口断开）");
+      }
     }
 
-    set_led_color();
+    // 关闭设备（使用错误处理而不是ESP_ERROR_CHECK，避免崩溃）
+    // 注意：如果设备已经断开，关闭可能会失败，这是正常的
+    esp_err_t close_ret = hid_host_device_close(hid_device_handle);
+    if (close_ret != ESP_OK)
+    {
+      ESP_LOGW(TAG_USB, "关闭HID设备失败: %s (设备可能已经断开)", esp_err_to_name(close_ret));
+    }
+    else
+    {
+      ESP_LOGI(TAG_USB, "HID设备已成功关闭");
+    }
+
+    // 更新LED颜色（在设备关闭后）
+    update_led_color();
     break;
   case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
     ESP_LOGI(TAG_HID, "HID Device, interface %d protocol '%s' TRANSFER_ERROR",
@@ -1186,10 +1231,25 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
       }
     }
 
-    ESP_ERROR_CHECK(hid_host_device_start(hid_device_handle));
-    set_led_color();
+    int ret = hid_host_device_start(hid_device_handle);
+    if (ret != ESP_OK)
+    {
+      ESP_LOGE(TAG_HID, "启动HID设备失败: %s", esp_err_to_name(ret));
+      // 如果启动失败，清理已注册的设备句柄
+      if (should_register_as_keyboard)
+      {
+        usb_hid_devices.keyboard_handle = NULL;
+      }
+      else if (should_register_as_mouse)
+      {
+        usb_hid_devices.mouse_handle = NULL;
+      }
+      return;
+    }
+    update_led_color();
     break;
   default:
+    ESP_LOGW(TAG_HID, "未处理的HID设备事件: %d", event);
     break;
   }
 }
@@ -1219,6 +1279,7 @@ static void usb_lib_task(void *arg)
     if (ret != ESP_OK)
     {
       ESP_LOGE(TAG_USB, "usb_host_lib_handle_events failed: %s", esp_err_to_name(ret));
+      // 如果发生错误，短暂延迟后继续，避免快速重试导致问题
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
@@ -1287,71 +1348,22 @@ void usb_hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
 }
 
 /* =================================================================================================
-   LED
+   LED控制辅助函数
    ================================================================================================= */
 
-led_strip_handle_t configure_led(void)
-{
-  // LED strip general initialization, according to your led board design
-  led_strip_config_t strip_config = {
-      .strip_gpio_num = LED_GPIO_PIN,                              // The GPIO that connected to the LED strip's data line
-      .max_leds = 1,                                               // The number of LEDs in the strip,
-      .led_model = LED_MODEL_WS2812,                               // LED strip model
-      .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB, // The color order of the strip: GRB
-      .flags = {
-          .invert_out = false, // don't invert the output signal
-      }};
-
-  // LED strip backend configuration: RMT
-  led_strip_rmt_config_t rmt_config = {
-      .clk_src = RMT_CLK_SRC_DEFAULT,  // different clock source can lead to different power consumption
-      .resolution_hz = LED_RMT_RES_HZ, // RMT counter clock frequency
-      .mem_block_symbols = 64,         // the memory size of each RMT channel, in words (4 bytes)
-      .flags = {
-          .with_dma = false, // DMA feature is available on chips like ESP32-S3/P4
-      }};
-
-  // LED Strip object handle
-  led_strip_handle_t led_strip;
-  ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-  ESP_ERROR_CHECK(led_strip_clear(led_strip));
-  ESP_LOGI(TAG_LED, "Created LED strip object with RMT backend");
-  return led_strip;
-}
-
 /**
- * @brief Set LED color based on USB and BLE HID connection status
+ * @brief 更新LED颜色（根据当前连接状态）
  */
-void set_led_color()
+static void update_led_color(void)
 {
-  bool usb_device_connected = (usb_hid_devices.keyboard_handle != NULL || usb_hid_devices.mouse_handle != NULL);
-  printf("USB HID: %s (键盘:%s, 鼠标:%s), BLE HID: %s\n",
-         usb_device_connected ? "已连接" : "未连接",
-         usb_hid_devices.keyboard_handle != NULL ? "是" : "否",
-         usb_hid_devices.mouse_handle != NULL ? "是" : "否",
-         sec_conn ? "已连接" : "未连接");
+  if (led_strip == NULL)
+  {
+    return;
+  }
 
-  if (usb_device_connected && sec_conn)
-  {
-    // USB设备已连接且BLE已连接 - 白色
-    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, LED_BRIGHTNESS, LED_BRIGHTNESS, LED_BRIGHTNESS));
-  }
-  else if (usb_device_connected)
-  {
-    // USB设备已连接但BLE未连接 - 绿色
-    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, LED_BRIGHTNESS, 0));
-  }
-  else if (sec_conn)
-  {
-    // BLE已连接但USB设备未连接 - 蓝色
-    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, 0, LED_BRIGHTNESS));
-  }
-  else
-  {
-    // 都未连接 - 红色
-    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, LED_BRIGHTNESS, 0, 0));
-  }
-  ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+  bool usb_keyboard_connected = (usb_hid_devices.keyboard_handle != NULL);
+  bool usb_mouse_connected = (usb_hid_devices.mouse_handle != NULL);
+  led_control_set_color(led_strip, usb_keyboard_connected, usb_mouse_connected, sec_conn);
 }
 
 void app_main(void)
@@ -1473,8 +1485,9 @@ void app_main(void)
   ESP_LOGI(TAG_HID, "等待USB HID设备连接...");
   ESP_LOGI(TAG_USB, "提示: 请插入USB键盘或鼠标设备");
 
-  led_strip = configure_led();
-  set_led_color();
+  // 初始化LED控制模块
+  led_strip = led_control_init();
+  update_led_color();
 
   // 初始化鼠标累加器模块（创建BLE发送定时器）
   ESP_ERROR_CHECK(mouse_accumulator_init());

@@ -7,6 +7,7 @@ idf_component_register(
   "hid_report_parser.c"
   "hid_device_type_detector.c"
   "mouse_accumulator.c"
+  "led_control.c"
   INCLUDE_DIRS
   "."
   PRIV_REQUIRES
