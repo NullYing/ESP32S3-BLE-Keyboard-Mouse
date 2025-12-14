@@ -90,6 +90,15 @@ This project includes significant improvements over basic USB-to-BLE implementat
 - Single BLE device can act as Keyboard, Mouse, Consumer Control, and Gamepad simultaneously
 - Proper HID Report Map with multiple Report IDs
 
+#### **6. USB HID Report Map Parsing**
+- **Problem Solved**: USB HID devices use complex report descriptors that need to be parsed to extract input data correctly, especially for Report Protocol mode devices
+- **Solution**: Advanced HID report parser that can handle various report descriptor formats and extract keycodes, mouse movements, and button states accurately
+- **Benefits**:
+  - Supports both Boot Protocol and Report Protocol modes
+  - Handles complex report descriptors with multiple Report IDs
+  - Accurate extraction of all input fields including buttons, axes, and consumer controls
+  - Compatible with a wide range of USB HID devices
+
 ---
 
 ### ⚙️ How It Works
@@ -168,6 +177,7 @@ idf.py flash monitor
 This project is built upon the excellent work of:
 
 - **[Vengeance110703/USB-to-BLE-Keyboard](https://github.com/Vengeance110703/USB-to-BLE-Keyboard)** – Original USB-to-BLE keyboard implementation that served as the foundation for this project
+- **[pasztorpisti/hid-report-parser](https://github.com/pasztorpisti/hid-report-parser/)** – USB HID report parser library that provided inspiration and reference for HID descriptor parsing
 - **Espressif Systems** – For ESP-IDF framework and ESP32-S3 hardware
 - **TinyUSB** – For the robust USB Host stack
 - **ESP-IDF BLE HID Examples** – For the BLE HID profile implementation foundation
@@ -262,6 +272,15 @@ Special thanks to the open-source community for their contributions and feedback
 - 单个 BLE 设备可同时作为键盘、鼠标、消费控制和游戏手柄使用
 - 具有多个 Report ID 的完整 HID Report Map
 
+#### **6. USB HID Report Map 解析**
+- **解决的问题**：USB HID 设备使用复杂的报告描述符，需要正确解析才能提取输入数据，特别是 Report Protocol 模式设备
+- **解决方案**：先进的 HID 报告解析器，能够处理各种报告描述符格式，准确提取键码、鼠标移动和按键状态
+- **优势**：
+  - 支持 Boot Protocol 和 Report Protocol 两种模式
+  - 处理具有多个 Report ID 的复杂报告描述符
+  - 准确提取所有输入字段，包括按键、轴和消费控制
+  - 兼容广泛的 USB HID 设备
+
 ---
 
 ### ⚙️ 工作原理
@@ -340,6 +359,7 @@ idf.py flash monitor
 本项目基于以下优秀工作构建：
 
 - **[Vengeance110703/USB-to-BLE-Keyboard](https://github.com/Vengeance110703/USB-to-BLE-Keyboard)** – 原始 USB-to-BLE 键盘实现，为本项目提供了基础
+- **[pasztorpisti/hid-report-parser](https://github.com/pasztorpisti/hid-report-parser/)** – USB HID 报告解析器库，为 HID 描述符解析提供了参考和灵感
 - **Espressif Systems** – 提供 ESP-IDF 框架和 ESP32-S3 硬件
 - **TinyUSB** – 提供强大的 USB Host 协议栈
 - **ESP-IDF BLE HID 示例** – 提供 BLE HID 配置文件实现基础
