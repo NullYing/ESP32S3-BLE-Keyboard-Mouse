@@ -19,7 +19,7 @@
 #endif
 
 // HID mouse input report length (必须与esp_hidd_prf_api.c和hid_host_example.c保持一致)
-// 基于 Zephyr report map: 按钮(1字节: 3位按钮+5位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
+// 基于 report map: 按钮(1字节: 5位按钮+3位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
 // 注意：即使发送 8bit 数据，报告长度仍为 6 字节（8bit 数据放在 16bit 字段的低 8 位）
 #define HID_MOUSE_IN_RPT_LEN 6 // 按钮(1) + X(2) + Y(2) + Wheel(1) = 6字节（兼容 8bit 和 16bit）
 
@@ -125,18 +125,18 @@ static const uint8_t hidReportMap[] = {
     0x09, 0x01, //   Usage (Pointer)
     0xA1, 0x00, //   Collection (Physical)
 
-    // Buttons (3 bits)
+    // Buttons (5 bits) -> 支持侧键 4/5
     0x05, 0x09, //     Usage Page (Buttons)
-    0x19, 0x01, //     Usage Minimum (01) - Button 1
-    0x29, 0x03, //     Usage Maximum (03) - Button 3
-    0x15, 0x00, //     Logical Minimum (0)
-    0x25, 0x01, //     Logical Maximum (1)
+    0x19, 0x01, //     Usage Minimum (Button 1)
+    0x29, 0x05, //     Usage Maximum (Button 5)
+    0x15, 0x00, //     Logical Min (0)
+    0x25, 0x01, //     Logical Max (1)
     0x75, 0x01, //     Report Size (1)
-    0x95, 0x03, //     Report Count (3)
-    0x81, 0x02, //     Input (Data, Variable, Absolute)
+    0x95, 0x05, //     Report Count (5)
+    0x81, 0x02, //     Input (Data, Var, Abs)
 
-    // Padding (5 bits)
-    0x75, 0x05, //     Report Size (5)
+    // Padding (3 bits) -> 凑满 1 byte
+    0x75, 0x03, //     Report Size (3)
     0x95, 0x01, //     Report Count (1)
     0x81, 0x01, //     Input (Constant)
 
@@ -595,7 +595,7 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 #endif
 #endif
       ESP_LOGI(HID_LE_PRF_TAG, "鼠标报告结构 (Report ID 3):");
-      ESP_LOGI(HID_LE_PRF_TAG, "  - 按钮: 3位 (左、右、中键) + 5位padding = 1字节 (字节0)");
+      ESP_LOGI(HID_LE_PRF_TAG, "  - 按钮: 5位 (Button1~5，支持侧键) + 3位padding = 1字节 (字节0)");
       ESP_LOGI(HID_LE_PRF_TAG, "  - X: 16位 = 2字节 (字节1-2, little-endian, 兼容 8bit 和 16bit)");
       ESP_LOGI(HID_LE_PRF_TAG, "  - Y: 16位 = 2字节 (字节3-4, little-endian, 兼容 8bit 和 16bit)");
       ESP_LOGI(HID_LE_PRF_TAG, "  - Wheel: 8位 = 1字节 (字节5)");

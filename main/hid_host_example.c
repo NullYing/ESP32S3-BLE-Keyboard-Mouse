@@ -474,8 +474,8 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   // USB Report Protocol 鼠标报告格式：长度可变，可能包含 Report ID
   //   常见格式1：按钮(1) + X(1) + Y(1) + 滚轮(1) = 4字节
   //   常见格式2：Report ID(1) + 按钮(1) + X(1) + Y(1) + 滚轮(1) + 其他(3) = 8字节（macOS常见）
-  // BLE鼠标报告格式（基于 Zephyr report map，兼容 8bit 和 16bit）：
-  //   按钮(1字节: 3位按钮+5位padding) + X(16位,2字节) + Y(16位,2字节) + Wheel(8位,1字节) = 6字节
+  // BLE鼠标报告格式（基于 report map，兼容 8bit 和 16bit）：
+  //   按钮(1字节: 5位按钮+3位padding) + X(16位,2字节) + Y(16位,2字节) + Wheel(8位,1字节) = 6字节
 
   if (length < 3)
   {
@@ -622,7 +622,7 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
       // Buttons 数据提取（参考 asterics 仓库逻辑）
       // ========================================================================
       // 直接提取完整的 buttons 值，不进行中间转换
-      // 在打包时直接使用 buttons_u & 0x07 获取低3位
+      // 在打包时直接使用 buttons_u & 0x1F 获取低5位（支持侧键）
       // ========================================================================
       buttons_u = get_bits_u32(data, length, use_layout->buttons_bit_offset + bit_offset_adjust, use_layout->buttons_count);
       int32_t x_raw = use_layout->x_size ? get_bits_s32(data, length, use_layout->x_bit_offset + bit_offset_adjust, use_layout->x_size) : 0;
@@ -754,17 +754,56 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   // BLE发送由定时器节拍触发，实现USB输入和BLE发送的彻底解耦
   // ========================================================================
 
-  // 确定最终的按钮值（取低3位）
+  // 确定最终的按钮值（取低5位，支持侧键）
   uint8_t buttons_final;
   if (use_layout != NULL && use_layout->buttons_count > 0)
   {
-    // 从 use_layout 路径：直接使用 buttons_u 的低3位
-    buttons_final = (uint8_t)(buttons_u & 0x07);
+    // 从 use_layout 路径：直接使用 buttons_u 的低5位
+    buttons_final = (uint8_t)(buttons_u & 0x1F);
   }
   else
   {
-    // 回退路径：使用 buttons 的低3位
-    buttons_final = buttons & 0x07;
+    // 回退路径：使用 buttons 的低5位
+    buttons_final = buttons & 0x1F;
+  }
+
+  // 检测按钮状态变化并打印日志（特别是侧键）
+  static uint8_t last_buttons_logged = 0;
+  if (buttons_final != last_buttons_logged)
+  {
+    // 检测各个按钮的状态变化
+    uint8_t changed = buttons_final ^ last_buttons_logged;
+    uint8_t pressed = buttons_final & changed;
+
+    // 打印按钮状态变化
+    if (changed != 0)
+    {
+      // 获取原始按钮值用于调试
+      uint32_t raw_buttons_u = (use_layout != NULL && use_layout->buttons_count > 0) ? buttons_u : buttons;
+      ESP_LOGI(TAG_MOUSE, "[USB 按钮] 状态变化: 0x%02X -> 0x%02X (原始值: 0x%08" PRIX32 ", 使用layout: %s)",
+               last_buttons_logged, buttons_final, raw_buttons_u,
+               (use_layout != NULL && use_layout->buttons_count > 0) ? "是" : "否");
+
+      // 检测每个按钮
+      if (changed & 0x01)
+        ESP_LOGI(TAG_MOUSE, "  Button 1 (左键): %s", (pressed & 0x01) ? "按下" : "释放");
+      if (changed & 0x02)
+        ESP_LOGI(TAG_MOUSE, "  Button 2 (右键): %s", (pressed & 0x02) ? "按下" : "释放");
+      if (changed & 0x04)
+        ESP_LOGI(TAG_MOUSE, "  Button 3 (中键): %s", (pressed & 0x04) ? "按下" : "释放");
+      if (changed & 0x08)
+        ESP_LOGI(TAG_MOUSE, "  Button 4 (侧键1): %s", (pressed & 0x08) ? "按下" : "释放");
+      if (changed & 0x10)
+        ESP_LOGI(TAG_MOUSE, "  Button 5 (侧键2): %s", (pressed & 0x10) ? "按下" : "释放");
+
+      // 如果有其他位变化（超出5位范围），也打印出来
+      if (changed & 0xE0)
+      {
+        ESP_LOGI(TAG_MOUSE, "  其他按钮位变化: 0x%02X (超出5键范围)", changed & 0xE0);
+      }
+    }
+
+    last_buttons_logged = buttons_final;
   }
 
   // 累加到全局累加器（线程安全）

@@ -27,7 +27,7 @@
 #define USE_16BIT_MOUSE_PRECISION 1
 #endif
 
-// 基于 Zephyr report map: 按钮(1字节: 3位按钮+5位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
+// 基于 report map: 按钮(1字节: 5位按钮+3位padding) + X(2字节, 16bit) + Y(2字节, 16bit) + Wheel(1字节) = 6字节
 // 注意：即使发送 8bit 数据，报告长度仍为 6 字节（8bit 数据放在 16bit 字段的低 8 位）
 #define HID_MOUSE_IN_RPT_LEN 6 // 按钮(1) + X(2) + Y(2) + Wheel(1) = 6字节（兼容 8bit 和 16bit）
 
@@ -154,8 +154,8 @@ void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mi
 {
   uint8_t buffer[HID_MOUSE_IN_RPT_LEN] = {0};
 
-  // 按钮：只使用低3位（左、右、中键），高5位为padding（自动为0）
-  buffer[0] = mouse_button & 0x07; // 只保留低3位，符合 Zephyr report map 的3个按钮定义
+  // 按钮：使用低5位（Button1~5，支持侧键），高3位为padding（自动为0）
+  buffer[0] = mouse_button & 0x1F; // 只保留低5位，符合 report map 的5个按钮定义
 
 #if USE_16BIT_MOUSE_PRECISION
   // 16位格式：发送完整的16位数据

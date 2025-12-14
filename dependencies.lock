@@ -33,6 +33,6 @@ direct_dependencies:
 - espressif/led_strip
 - espressif/usb_host_hid
 - idf
-manifest_hash: 79a030e679241b052193768d7831637b680f603b91ddd777cb95a4eb9e0194f7
+manifest_hash: 0365076dbde230998c4de8ac3be3348b7c1aab9f7efa21627a29749c1050bae6
 target: esp32s3
 version: 2.0.0
