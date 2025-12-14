@@ -364,6 +364,32 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
       set_led_color();
     }
     break;
+  case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+    // BLE连接参数更新完成事件
+    // 根据实际协商的连接间隔更新鼠标发送间隔
+    if (param->update_conn_params.status == ESP_BT_STATUS_SUCCESS)
+    {
+      uint16_t conn_int = param->update_conn_params.conn_int;
+      uint16_t conn_latency = param->update_conn_params.latency;
+      uint16_t conn_timeout = param->update_conn_params.timeout;
+
+      ESP_LOGI(TAG_BLE, "BLE连接参数更新完成: interval=%d (%.2f ms), latency=%d, timeout=%d (%.2f ms)",
+               conn_int, (float)conn_int * 1.25f,
+               conn_latency,
+               conn_timeout, (float)conn_timeout * 1.25f);
+
+      // 根据实际连接间隔更新鼠标发送间隔
+      esp_err_t ret = mouse_accumulator_update_send_interval(conn_int);
+      if (ret != ESP_OK)
+      {
+        ESP_LOGW(TAG_BLE, "更新鼠标发送间隔失败: %s", esp_err_to_name(ret));
+      }
+    }
+    else
+    {
+      ESP_LOGW(TAG_BLE, "BLE连接参数更新失败,状态: 0x%02x", param->update_conn_params.status);
+    }
+    break;
   default:
     break;
   }

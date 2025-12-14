@@ -43,6 +43,9 @@ static mouse_motion_accumulator_t g_acc = {
 // BLE发送定时器句柄
 static esp_timer_handle_t s_send_timer = NULL;
 
+// 当前BLE发送间隔(微秒),动态更新
+static uint32_t s_current_send_interval_us = BLE_SEND_INTERVAL_US_DEFAULT;
+
 /* =================================================================================================
    内部辅助函数
    ================================================================================================= */
@@ -194,7 +197,7 @@ esp_err_t mouse_accumulator_init(void)
   }
 
   // 启动定时器(周期性触发)
-  ret = esp_timer_start_periodic(s_send_timer, BLE_SEND_INTERVAL_US);
+  ret = esp_timer_start_periodic(s_send_timer, s_current_send_interval_us);
   if (ret != ESP_OK)
   {
     ESP_LOGE(TAG, "启动BLE发送定时器失败: %s", esp_err_to_name(ret));
@@ -205,7 +208,7 @@ esp_err_t mouse_accumulator_init(void)
 
   ESP_LOGI(TAG, "鼠标累加器初始化成功(方案A: Ring Buffer)");
   ESP_LOGI(TAG, "  - Ring容量: %d条事件", RING_BUFFER_CAPACITY);
-  ESP_LOGI(TAG, "  - 发送周期: %d us (约%.1f Hz)", BLE_SEND_INTERVAL_US, 1000000.0 / BLE_SEND_INTERVAL_US);
+  ESP_LOGI(TAG, "  - 发送周期: %u us (约%.1f Hz)", (unsigned int)s_current_send_interval_us, 1000000.0 / s_current_send_interval_us);
 
   return ESP_OK;
 }
@@ -473,4 +476,67 @@ void mouse_accumulator_get_stats(uint32_t *events_in_ring,
       *total_failures = g_acc.total_send_failures;
   }
   portEXIT_CRITICAL(&g_acc.ring.spinlock);
+}
+
+esp_err_t mouse_accumulator_update_send_interval(uint16_t conn_interval_units)
+{
+  if (s_send_timer == NULL)
+  {
+    ESP_LOGE(TAG, "定时器未初始化,无法更新发送间隔");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // BLE连接间隔单位: 1.25ms
+  // 转换为微秒: conn_interval_units * 1.25 * 1000
+  // 为了避免浮点运算: conn_interval_units * 1250 / 1000
+  // 简化: conn_interval_units * 5 / 4 (因为 1.25 = 5/4)
+  uint32_t new_interval_us = (uint32_t)conn_interval_units * 1250;
+
+  // 限制范围: 最小1ms,最大100ms
+  if (new_interval_us < 1000)
+  {
+    new_interval_us = 1000;
+    ESP_LOGW(TAG, "连接间隔过小,限制为1ms");
+  }
+  else if (new_interval_us > 100000)
+  {
+    new_interval_us = 100000;
+    ESP_LOGW(TAG, "连接间隔过大,限制为100ms");
+  }
+
+  // 如果间隔没有变化,直接返回
+  if (new_interval_us == s_current_send_interval_us)
+  {
+    ESP_LOGD(TAG, "发送间隔未变化: %u us", (unsigned int)s_current_send_interval_us);
+    return ESP_OK;
+  }
+
+  // 停止当前定时器
+  esp_err_t ret = esp_timer_stop(s_send_timer);
+  if (ret != ESP_OK)
+  {
+    ESP_LOGE(TAG, "停止定时器失败: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  // 更新间隔
+  uint32_t old_interval_us = s_current_send_interval_us;
+  s_current_send_interval_us = new_interval_us;
+
+  // 重新启动定时器
+  ret = esp_timer_start_periodic(s_send_timer, s_current_send_interval_us);
+  if (ret != ESP_OK)
+  {
+    ESP_LOGE(TAG, "重启定时器失败: %s,恢复原间隔", esp_err_to_name(ret));
+    s_current_send_interval_us = old_interval_us;
+    esp_timer_start_periodic(s_send_timer, old_interval_us);
+    return ret;
+  }
+
+  ESP_LOGI(TAG, "BLE发送间隔已更新: %u us -> %u us (连接间隔: %u * 1.25ms = %.2f ms, 频率: %.1f Hz)",
+           (unsigned int)old_interval_us, (unsigned int)s_current_send_interval_us,
+           (unsigned int)conn_interval_units, (float)conn_interval_units * 1.25f,
+           1000000.0f / s_current_send_interval_us);
+
+  return ESP_OK;
 }

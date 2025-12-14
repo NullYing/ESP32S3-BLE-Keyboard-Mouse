@@ -28,7 +28,8 @@ extern "C"
 
 // BLE发送节拍周期(微秒)
 // 7.5ms = 7500us,对应约133Hz的发送频率,与BLE连接间隔匹配
-#define BLE_SEND_INTERVAL_US 7500
+// 注意: 实际值会根据BLE连接参数更新事件动态调整
+#define BLE_SEND_INTERVAL_US_DEFAULT 7500
 
 // Ring buffer容量 (必须是2的幂,方便取模优化)
 // 128条事件可以覆盖最坏情况: 1000Hz * 0.1s = 100条 + 余量
@@ -172,6 +173,17 @@ extern "C"
                                     uint32_t *total_popped,
                                     uint32_t *total_sent,
                                     uint32_t *total_failures);
+
+   /**
+    * @brief 根据实际BLE连接间隔动态更新发送间隔
+    *
+    * 在BLE连接参数更新完成后调用，根据实际协商的连接间隔调整发送定时器
+    *
+    * @param conn_interval_units BLE连接间隔(单位: 1.25ms)
+    *                            例如: 0x0006 = 6 * 1.25ms = 7.5ms
+    * @return ESP_OK 成功,其他值表示失败
+    */
+   esp_err_t mouse_accumulator_update_send_interval(uint16_t conn_interval_units);
 
 #ifdef __cplusplus
 }
