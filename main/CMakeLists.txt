@@ -14,6 +14,8 @@ idf_component_register(
   usb
   esp_driver_gpio
   bt
+  spi_flash
+  esp_psram
   nvs_flash
   esp_timer)
 
