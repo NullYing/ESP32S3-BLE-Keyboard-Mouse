@@ -274,6 +274,7 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
   {
     ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_CONNECT");
     ble_hid_conn_id = param->connect.conn_id;
+    ESP_LOGI(TAG_BLE, "BLE HID连接ID已设置: conn_id=%d", ble_hid_conn_id);
 
     // 更新BLE连接参数以提高回报率
     // min_interval = 0x0006 (7.5ms), max_interval = 0x0006 (7.5ms), latency = 0, timeout = 500 (625ms)
@@ -291,6 +292,7 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
   case ESP_HIDD_EVENT_BLE_DISCONNECT:
   {
     sec_conn = false;
+    ble_hid_conn_id = 0; // 重置连接ID
     ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_DISCONNECT");
 
     // 清理鼠标累加器（避免断线重连后发送旧数据）
@@ -447,15 +449,28 @@ static int32_t get_bits_s32(const uint8_t *data, int data_len, uint32_t bit_offs
  */
 static void hid_host_keyboard_report_callback(hid_host_device_handle_t hid_device_handle, uint8_t *data, int length)
 {
-
-  hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, HID_KEYBOARD_IN_RPT_LEN, data);
-
-  hid_keyboard_input_report_boot_t *kb_report = (hid_keyboard_input_report_boot_t *)data;
-
-  if (length < sizeof(hid_keyboard_input_report_boot_t))
+  // 检查BLE连接状态（sec_conn表示安全连接已建立，conn_id=0也是有效的连接ID）
+  if (!sec_conn)
   {
+    ESP_LOGW(TAG_KEYBOARD, "BLE未连接，跳过键盘报告发送 (sec_conn=%d, conn_id=%d)", sec_conn, ble_hid_conn_id);
     return;
   }
+
+  // 检查数据长度
+  if (length < sizeof(hid_keyboard_input_report_boot_t))
+  {
+    ESP_LOGW(TAG_KEYBOARD, "键盘报告长度不足: %d < %zu", length, sizeof(hid_keyboard_input_report_boot_t));
+    return;
+  }
+
+  // 发送键盘报告到BLE
+  esp_err_t ret = hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, HID_KEYBOARD_IN_RPT_LEN, data);
+  if (ret != ESP_OK)
+  {
+    ESP_LOGW(TAG_KEYBOARD, "发送键盘报告到BLE失败: %s (conn_id=%d)", esp_err_to_name(ret), ble_hid_conn_id);
+  }
+
+  hid_keyboard_input_report_boot_t *kb_report = (hid_keyboard_input_report_boot_t *)data;
 
 #if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
   if (kb_report->key[0] > 0 || kb_report->modifier.val > 0)

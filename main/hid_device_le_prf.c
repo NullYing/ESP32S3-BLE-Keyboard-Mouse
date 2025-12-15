@@ -517,6 +517,27 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
   case ESP_GATTS_WRITE_EVT:
   {
     esp_hidd_cb_param_t cb_param = {0};
+
+    // 检查是否是CCCD写入（启用/禁用通知）
+    if (param->write.handle == hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_KEY_IN_CCC])
+    {
+      uint16_t cccd_value = param->write.value[0] | (param->write.value[1] << 8);
+      ESP_LOGI(HID_LE_PRF_TAG, "键盘输入报告CCCD已写入: handle=%d, value=0x%04X, 通知%s",
+               param->write.handle, cccd_value, (cccd_value & 0x0001) ? "已启用" : "已禁用");
+    }
+    else if (param->write.handle == hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_CCC])
+    {
+      uint16_t cccd_value = param->write.value[0] | (param->write.value[1] << 8);
+      ESP_LOGI(HID_LE_PRF_TAG, "鼠标输入报告CCCD已写入: handle=%d, value=0x%04X, 通知%s",
+               param->write.handle, cccd_value, (cccd_value & 0x0001) ? "已启用" : "已禁用");
+    }
+    else if (param->write.handle == hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_CC_IN_CCC])
+    {
+      uint16_t cccd_value = param->write.value[0] | (param->write.value[1] << 8);
+      ESP_LOGI(HID_LE_PRF_TAG, "Consumer Control输入报告CCCD已写入: handle=%d, value=0x%04X, 通知%s",
+               param->write.handle, cccd_value, (cccd_value & 0x0001) ? "已启用" : "已禁用");
+    }
+
     if (param->write.handle == hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_LED_OUT_VAL])
     {
       cb_param.led_write.conn_id = param->write.conn_id;

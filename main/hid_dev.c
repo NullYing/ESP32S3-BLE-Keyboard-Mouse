@@ -63,17 +63,31 @@ esp_err_t hid_dev_send_report(esp_gatt_if_t gatts_if, uint16_t conn_id,
       const uint8_t *cccd_value_ptr = NULL;
       esp_err_t get_ret = esp_ble_gatts_get_attr_value(p_rpt->cccdHandle, &cccd_len, &cccd_value_ptr);
 
-      // 如果无法获取CCCD值，或者通知未启用（CCCD值不等于0x0001），则返回错误
-      if (get_ret != ESP_OK || cccd_len < sizeof(uint16_t))
+      // 如果无法获取CCCD值，记录警告但继续尝试发送（客户端可能还在配置中）
+      if (get_ret != ESP_OK)
       {
-        return ESP_ERR_INVALID_STATE; // 无法获取CCCD值或通知未启用
+        ESP_LOGW(HID_LE_PRF_TAG, "无法获取CCCD值: get_ret=%s, report_id=%d, type=%d, cccd_handle=%d",
+                 esp_err_to_name(get_ret), id, type, p_rpt->cccdHandle);
+        // 继续尝试发送，让底层BLE栈处理
       }
-
-      // 读取CCCD值（little-endian）
-      uint16_t cccd_value = cccd_value_ptr[0] | (cccd_value_ptr[1] << 8);
-      if ((cccd_value & 0x0001) == 0)
+      // 如果CCCD长度为0，说明客户端还没有写入CCCD（还在服务发现阶段）
+      else if (cccd_len == 0)
       {
-        return ESP_ERR_INVALID_STATE; // 通知未启用
+        ESP_LOGD(HID_LE_PRF_TAG, "CCCD尚未写入（客户端可能还在配置中）: report_id=%d, type=%d, cccd_handle=%d",
+                 id, type, p_rpt->cccdHandle);
+        // 继续尝试发送，某些客户端可能不会写入CCCD但仍然可以接收通知
+      }
+      // 如果CCCD长度有效，检查通知是否已启用
+      else if (cccd_len >= sizeof(uint16_t))
+      {
+        // 读取CCCD值（little-endian）
+        uint16_t cccd_value = cccd_value_ptr[0] | (cccd_value_ptr[1] << 8);
+        if ((cccd_value & 0x0001) == 0)
+        {
+          ESP_LOGW(HID_LE_PRF_TAG, "通知已禁用: cccd_value=0x%04X, report_id=%d, type=%d, cccd_handle=%d",
+                   cccd_value, id, type, p_rpt->cccdHandle);
+          return ESP_ERR_INVALID_STATE; // 通知已明确禁用
+        }
       }
     }
 
