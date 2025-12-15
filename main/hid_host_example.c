@@ -956,6 +956,7 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
     if (HID_PROTOCOL_KEYBOARD == dev_params.proto)
     {
       // 键盘：Boot Protocol 固定8字节，Report Protocol 可能不同长度
+#if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
       if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class && data_length == 8)
       {
         ESP_LOGI(TAG_KEYBOARD, "Keyboard Event (Boot Protocol, len=%d)", data_length);
@@ -964,6 +965,7 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
       {
         ESP_LOGI(TAG_KEYBOARD, "Keyboard Event (Report Protocol, len=%d)", data_length);
       }
+#endif
       hid_host_keyboard_report_callback(hid_device_handle, data, data_length);
     }
     else if (HID_PROTOCOL_MOUSE == dev_params.proto)
