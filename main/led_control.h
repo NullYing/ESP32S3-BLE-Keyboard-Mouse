@@ -17,7 +17,7 @@ extern "C"
 #endif
 
 // LED配置参数
-#define LED_GPIO_PIN 48
+#define LED_GPIO_PIN GPIO_NUM_48
 #define LED_RMT_RES_HZ (10 * 1000 * 1000)
 #define LED_BRIGHTNESS 25
 
