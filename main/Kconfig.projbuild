@@ -4,4 +4,11 @@ menu "BLE_keyboard_mouse"
         default y
         help
             Enable the Joystick interface for Bluetooth.
+
+    config DEBUG_KEY_MOUSE_PRESS
+        bool "Enable debug logs for keyboard and mouse button presses"
+        default n
+        help
+            When enabled, print debug logs when keyboard keys or mouse buttons are pressed.
+            When disabled, no debug logs will be printed for key/button presses.
 endmenu

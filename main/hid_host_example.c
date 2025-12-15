@@ -457,6 +457,7 @@ static void hid_host_keyboard_report_callback(hid_host_device_handle_t hid_devic
     return;
   }
 
+#if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
   if (kb_report->key[0] > 0 || kb_report->modifier.val > 0)
   {
     putchar('\n');
@@ -477,6 +478,7 @@ static void hid_host_keyboard_report_callback(hid_host_device_handle_t hid_devic
       putchar('\n');
     }
   }
+#endif
 }
 
 /**
@@ -786,6 +788,7 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
   }
 
   // 检测按钮状态变化并打印日志（特别是侧键）
+#if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
   static uint8_t last_buttons_logged = 0;
   if (buttons_final != last_buttons_logged)
   {
@@ -823,6 +826,7 @@ static void hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_h
 
     last_buttons_logged = buttons_final;
   }
+#endif
 
   // 累加到全局累加器（线程安全）
   mouse_accumulator_add(x, y, wheel, buttons_final);

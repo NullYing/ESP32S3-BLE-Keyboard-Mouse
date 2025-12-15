@@ -388,22 +388,6 @@ void mouse_accumulator_try_send(void)
   ble_mouse_report[5] = (uint8_t)wheel_send;
 
   // ========== 6. 尝试BLE notify ==========
-
-  // 调试：打印按钮状态变化时的 BLE 报告内容
-  static uint8_t last_btn_sent = 0;
-  if (button_dirty || (btn != last_btn_sent))
-  {
-    ESP_LOGI(TAG, "[BLE 发送] 按钮状态: 0x%02X -> 0x%02X, button_dirty=%d, 报告: [0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X]",
-             last_btn_sent, btn, button_dirty,
-             ble_mouse_report[0], ble_mouse_report[1], ble_mouse_report[2],
-             ble_mouse_report[3], ble_mouse_report[4], ble_mouse_report[5]);
-    if (btn & 0x08)
-      ESP_LOGI(TAG, "  -> Button 4 (侧键1) 在报告中");
-    if (btn & 0x10)
-      ESP_LOGI(TAG, "  -> Button 5 (侧键2) 在报告中");
-    last_btn_sent = btn;
-  }
-
   esp_err_t ret = mouse_accumulator_send_ble_report(ble_mouse_report, 6);
 
   if (ret == ESP_OK)
