@@ -1048,8 +1048,29 @@ void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
     update_led_color();
     break;
   case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
-    ESP_LOGI(TAG_HID, "HID Device, interface %d protocol '%s' TRANSFER_ERROR",
+    ESP_LOGW(TAG_HID, "HID Device, interface %d protocol '%s' TRANSFER_ERROR",
              dev_params.iface_num, hid_proto_name_str[dev_params.proto]);
+
+    // Transfer错误时，设备接口可能处于异常状态，无法直接操作
+    // 采用保守策略：只清除应用层句柄，让驱动层自动恢复
+    // 驱动层会在适当时机自动重试或触发重新连接事件
+    if (dev_params.proto == HID_PROTOCOL_KEYBOARD && usb_hid_devices.keyboard_handle == hid_device_handle)
+    {
+      ESP_LOGW(TAG_KEYBOARD, "键盘设备传输错误，清除句柄（驱动层将自动恢复）");
+      usb_hid_devices.keyboard_handle = NULL;
+      update_led_color();
+    }
+    else if (dev_params.proto == HID_PROTOCOL_MOUSE && usb_hid_devices.mouse_handle == hid_device_handle)
+    {
+      ESP_LOGW(TAG_MOUSE, "鼠标设备传输错误，清除句柄（驱动层将自动恢复）");
+      usb_hid_devices.mouse_handle = NULL;
+      g_cached_layout = NULL;
+      g_cached_report_id = 0xFF;
+      g_mouse_layout_count = 0;
+      update_led_color();
+    }
+    // 注意：不尝试关闭或重启设备，因为接口状态可能异常
+    // 驱动层会在适当时机自动处理恢复或触发DISCONNECTED事件
     break;
   default:
     ESP_LOGE(TAG_HID, "HID Device, interface %d protocol '%s' Unhandled event",
