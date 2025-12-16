@@ -569,7 +569,7 @@ CONFIG_PARTITION_TABLE_MD5=y
 # BLE_keyboard_mouse
 #
 # CONFIG_MODULE_USEJOYSTICK is not set
-# CONFIG_DEBUG_KEY_MOUSE_PRESS is not set
+CONFIG_DEBUG_KEY_MOUSE_PRESS=y
 # end of BLE_keyboard_mouse
 
 #

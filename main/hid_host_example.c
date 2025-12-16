@@ -1104,6 +1104,14 @@ void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
     printf("address: %d, interface: %d, subclass: %d, protocol: %d %s\n",
            dev_params.addr, dev_params.iface_num, dev_params.sub_class, dev_params.proto, hid_proto_name_str[dev_params.proto]);
 
+    // 只处理键盘和鼠标接口，跳过其他接口（如厂商自定义接口、protocol=0 NONE等）
+    // 这样可以避免资源耗尽，特别是对于复合设备（Composite Device）
+    if (dev_params.proto != HID_PROTOCOL_KEYBOARD && dev_params.proto != HID_PROTOCOL_MOUSE)
+    {
+      ESP_LOGI(TAG_HID, "跳过不需要的接口（protocol=%d %s），不进行claim", dev_params.proto, hid_proto_name_str[dev_params.proto]);
+      return;
+    }
+
     const hid_host_device_config_t dev_config = {
         .callback = usb_hid_host_interface_callback,
         .callback_arg = NULL};
