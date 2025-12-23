@@ -337,11 +337,26 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
     {
       // 复制数据到本地缓冲区（避免使用param->led_write.data，因为它可能在回调返回后失效）
       uint8_t led_data = param->led_write.data[0];
+
+      // 使用Report ID 0发送LED报告（对于Boot Protocol兼容的键盘）
+      // 注意：大多数USB键盘的LED Output Report不使用Report ID
       esp_err_t ret = hid_class_request_set_report(usb_hid_devices.keyboard_handle, HID_REPORT_TYPE_OUTPUT, 0, &led_data, 1);
       if (ret != ESP_OK)
       {
         ESP_LOGW(TAG_BLE, "LED转发失败: %s", esp_err_to_name(ret));
       }
+      else
+      {
+        ESP_LOGI(TAG_BLE, "LED转发成功: 0x%02X -> USB键盘 (Num:%s Caps:%s Scroll:%s)",
+                 led_data,
+                 (led_data & 0x01) ? "ON" : "OFF",
+                 (led_data & 0x02) ? "ON" : "OFF",
+                 (led_data & 0x04) ? "ON" : "OFF");
+      }
+    }
+    else
+    {
+      ESP_LOGW(TAG_BLE, "USB键盘未连接，无法转发LED报告");
     }
     break;
   }
