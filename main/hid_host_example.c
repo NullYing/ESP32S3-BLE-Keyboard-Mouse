@@ -310,14 +310,39 @@ static void ble_hid_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_
   }
   case ESP_HIDD_EVENT_BLE_LED_REPORT_WRITE_EVT:
   {
-    ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_LED_REPORT_WRITE_EVT");
-    // 发送LED报告到键盘设备（如果已连接）
+    // 检查数据长度
+    if (param->led_write.length < 1)
+    {
+      ESP_LOGW(TAG_BLE, "LED报告数据长度不足: %d < 1", param->led_write.length);
+      break;
+    }
+
+    // 解析LED状态位（快速解析，避免阻塞）
+    uint8_t led_state = param->led_write.data[0];
+    bool num_lock = (led_state & 0x01) != 0;
+    bool caps_lock = (led_state & 0x02) != 0;
+    bool scroll_lock = (led_state & 0x04) != 0;
+
+    // 使用简化的日志输出（减少日志开销，避免阻塞BLE回调）
+    ESP_LOGI(TAG_BLE, "收到LED报告: 0x%02X (Num:%s Caps:%s Scroll:%s)",
+             led_state,
+             num_lock ? "ON" : "OFF",
+             caps_lock ? "ON" : "OFF",
+             scroll_lock ? "ON" : "OFF");
+
+    // 快速转发LED报告到USB键盘（如果已连接）
+    // 注意：hid_class_request_set_report可能阻塞，但这是必要的操作
+    // 如果频繁出现问题，可以考虑使用队列异步处理
     if (usb_hid_devices.keyboard_handle)
     {
-      ESP_ERROR_CHECK(hid_class_request_set_report(usb_hid_devices.keyboard_handle, HID_REPORT_TYPE_OUTPUT, 0, param->led_write.data, param->led_write.length));
+      // 复制数据到本地缓冲区（避免使用param->led_write.data，因为它可能在回调返回后失效）
+      uint8_t led_data = param->led_write.data[0];
+      esp_err_t ret = hid_class_request_set_report(usb_hid_devices.keyboard_handle, HID_REPORT_TYPE_OUTPUT, 0, &led_data, 1);
+      if (ret != ESP_OK)
+      {
+        ESP_LOGW(TAG_BLE, "LED转发失败: %s", esp_err_to_name(ret));
+      }
     }
-    ESP_LOG_BUFFER_HEX(TAG_BLE, param->led_write.data, param->led_write.length);
-    printBinary(param->led_write.data[0]);
     break;
   }
   default:
@@ -464,10 +489,17 @@ static void hid_host_keyboard_report_callback(hid_host_device_handle_t hid_devic
   }
 
   // 发送键盘报告到BLE
+  ESP_LOGI(TAG_KEYBOARD, "准备发送键盘报告: report_id=%d, length=%d, data[0]=0x%02X, conn_id=%d",
+           HID_RPT_ID_KEY_IN, HID_KEYBOARD_IN_RPT_LEN, data[0], ble_hid_conn_id);
   esp_err_t ret = hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, HID_KEYBOARD_IN_RPT_LEN, data);
   if (ret != ESP_OK)
   {
-    ESP_LOGW(TAG_KEYBOARD, "发送键盘报告到BLE失败: %s (conn_id=%d)", esp_err_to_name(ret), ble_hid_conn_id);
+    ESP_LOGW(TAG_KEYBOARD, "发送键盘报告到BLE失败: %s (conn_id=%d, report_id=%d)",
+             esp_err_to_name(ret), ble_hid_conn_id, HID_RPT_ID_KEY_IN);
+  }
+  else
+  {
+    ESP_LOGI(TAG_KEYBOARD, "✓ 键盘报告已发送成功");
   }
 
   hid_keyboard_input_report_boot_t *kb_report = (hid_keyboard_input_report_boot_t *)data;

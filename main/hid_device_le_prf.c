@@ -54,16 +54,23 @@ static const uint8_t hidReportMap[] = {
     0xA1, 0x01, // Collection: (Application)
     0x85, 0x01, // Report Id (1)
 
+    // Keyboard Input Report
+    // Modifier byte (8 bits for modifier keys: Ctrl, Shift, Alt, GUI)
     0x05, 0x07, //   Usage Pg (Key Codes)
-    0x19, 0xE0, //   Usage Min (224)
-    0x29, 0xE7, //   Usage Max (231)
+    0x19, 0xE0, //   Usage Min (224) - Left Control
+    0x29, 0xE7, //   Usage Max (231) - Right GUI
     0x15, 0x00, //   Log Min (0)
     0x25, 0x01, //   Log Max (1)
-
     0x75, 0x01, //   Report Size (1)
     0x95, 0x08, //   Report Count (8)
-    0x81, 0x02, //   Input: (Data, Variable, Absolute)
+    0x81, 0x02, //   Input: (Data, Variable, Absolute) - Modifier byte
 
+    // Reserved byte (required by HID keyboard boot protocol for Windows compatibility)
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x08, //   Report Size (8)
+    0x81, 0x01, //   Input: (Constant) - Reserved byte
+
+    // Key array (6 keys)
     0x95, 0x06, //   Report Count (6)
     0x75, 0x08, //   Report Size (8)
     0x15, 0x00, //   Log Min (0)
@@ -71,7 +78,22 @@ static const uint8_t hidReportMap[] = {
     0x05, 0x07, //   Usage Pg (Key Codes)
     0x19, 0x00, //   Usage Min (0)
     0x29, 0x65, //   Usage Max (101)
-    0x81, 0x00, //   Input: (Data, Array)
+    0x81, 0x00, //   Input: (Data, Array) - Key array
+
+    // LED Output Report (标准HID键盘LED定义)
+    0x05, 0x08, //   Usage Pg (LEDs)
+    0x19, 0x01, //   Usage Min (Num Lock)
+    0x29, 0x05, //   Usage Max (Kana)
+    0x15, 0x00, //   Logical Min (0)
+    0x25, 0x01, //   Logical Max (1)
+    0x75, 0x01, //   Report Size (1)
+    0x95, 0x05, //   Report Count (5) - Num Lock, Caps Lock, Scroll Lock, Compose, Kana
+    0x91, 0x02, //   Output (Data, Variable, Absolute) - LED report
+
+    // Padding to align to byte boundary
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x03, //   Report Size (3)
+    0x91, 0x03, //   Output (Constant) - Padding
 
     0xC0, // End Collection
 

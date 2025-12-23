@@ -47,7 +47,7 @@
 #else
 #define HID_RPT_ID_VENDOR_OUT 4 // Vendor output report ID (如果没有 Gamepad，Vendor 使用 4)
 #endif
-#define HID_RPT_ID_LED_OUT 2 // LED output report ID (与 Keyboard 共享)
+#define HID_RPT_ID_LED_OUT 1 // LED output report ID (与 Keyboard 共享，在Keyboard Collection中定义)
 #define HID_RPT_ID_FEATURE 0 // Feature report ID
 
 #define HIDD_APP_ID 0x1812 // ATT_SVC_HID

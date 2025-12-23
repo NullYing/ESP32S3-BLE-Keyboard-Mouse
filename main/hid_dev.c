@@ -92,11 +92,22 @@ esp_err_t hid_dev_send_report(esp_gatt_if_t gatts_if, uint16_t conn_id,
     }
 
     // if notifications are enabled
-    ESP_LOGD(HID_LE_PRF_TAG, "%s(), send the report, handle = %d", __func__, p_rpt->handle);
+    ESP_LOGI(HID_LE_PRF_TAG, "发送报告: handle=%d, report_id=%d, type=%d, length=%d",
+             p_rpt->handle, id, type, length);
     esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, p_rpt->handle, length, data, false);
+    if (ret != ESP_OK)
+    {
+      ESP_LOGW(HID_LE_PRF_TAG, "发送报告失败: %s, handle=%d, report_id=%d, type=%d",
+               esp_err_to_name(ret), p_rpt->handle, id, type);
+    }
+    else
+    {
+      ESP_LOGI(HID_LE_PRF_TAG, "✓ 报告发送成功: report_id=%d", id);
+    }
     return ret;
   }
 
+  ESP_LOGW(HID_LE_PRF_TAG, "✗ 未找到报告映射: report_id=%d, type=%d", id, type);
   return ESP_ERR_NOT_FOUND;
 }
 
