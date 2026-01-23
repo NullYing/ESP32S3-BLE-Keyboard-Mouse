@@ -12,7 +12,7 @@ This project transforms an **ESP32-S3** into a powerful bridge between **USB HID
 
 **Key Highlights:**
 - ✅ **Full macOS Compatibility** – Optimized for macOS with Report Protocol support
-- ✅ **High DPI Mouse Support** – 16-bit precision (-32768 to 32767) for smooth high-resolution mouse movement
+- ✅ **High DPI Mouse Support** – 16-bit precision (-32767 to 32767) for smooth high-resolution mouse movement
 - ✅ **Composite HID Device** – Simultaneously supports Keyboard, Mouse, Consumer Control, and Gamepad
 - ✅ **Advanced Motion Processing** – Ring Buffer + Time Window resampling for stable, lossless mouse movement
 - ✅ **Multi-Button Mouse** – Supports up to 5 buttons (left, right, middle, side buttons 4 & 5)
@@ -37,7 +37,7 @@ This project transforms an **ESP32-S3** into a powerful bridge between **USB HID
 - **Stable Polling**: Fixed 7.5ms (133Hz) BLE transmission rate for consistent performance
 
 #### **High DPI Mouse Compatibility**
-- **16-bit Coordinate Range**: Supports mouse movement from -32768 to +32767 pixels per report
+- **16-bit Coordinate Range**: Supports mouse movement from -32767 to +32767 pixels per report
 - **Motion Accumulator**: Advanced Ring Buffer + Time Window algorithm ensures no movement loss
 - **Smooth Movement**: Handles high-frequency USB input (up to 1000Hz) and resamples to stable BLE rate
 
@@ -194,7 +194,7 @@ Special thanks to the open-source community for their contributions and feedback
 
 **核心亮点：**
 - ✅ **完整 macOS 兼容性** – 针对 macOS 优化，支持 Report Protocol
-- ✅ **高 DPI 鼠标支持** – 16 位精度（-32768 至 32767），支持高分辨率鼠标平滑移动
+- ✅ **高 DPI 鼠标支持** – 16 位精度（-32767 至 32767），支持高分辨率鼠标平滑移动
 - ✅ **复合 HID 设备** – 同时支持键盘、鼠标、消费控制（Consumer Control）和游戏手柄
 - ✅ **高级运动处理** – Ring Buffer + 时间窗重采样，确保稳定、无丢失的鼠标移动
 - ✅ **多按键鼠标** – 支持最多 5 个按键（左、右、中键及侧键 4、5）
@@ -219,7 +219,7 @@ Special thanks to the open-source community for their contributions and feedback
 - **稳定轮询**：固定 7.5ms（133Hz）BLE 传输速率，确保一致性能
 
 #### **高 DPI 鼠标兼容性**
-- **16 位坐标范围**：支持每次报告 -32768 至 +32767 像素的鼠标移动
+- **16 位坐标范围**：支持每次报告 -32767 至 +32767 像素的鼠标移动
 - **运动累加器**：先进的 Ring Buffer + 时间窗算法确保不丢失任何移动
 - **平滑移动**：处理高频 USB 输入（最高 1000Hz）并重采样为稳定的 BLE 速率
 

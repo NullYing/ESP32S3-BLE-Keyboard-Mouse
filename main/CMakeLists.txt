@@ -8,6 +8,8 @@ idf_component_register(
   "hid_device_type_detector.c"
   "mouse_accumulator.c"
   "led_control.c"
+  "ble_device_manager.c"
+  "ble_hid_send.c"
   INCLUDE_DIRS
   "."
   PRIV_REQUIRES
