@@ -274,7 +274,7 @@ struct gatts_profile_inst
 hidd_le_env_t hidd_le_env;
 
 // HID report map length
-uint8_t hidReportMapLen = sizeof(hidReportMap);
+uint16_t hidReportMapLen = sizeof(hidReportMap);
 uint8_t hidProtocolMode = HID_PROTOCOL_MODE_REPORT;
 
 // HID report mapping table
