@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,40 +37,26 @@
 #include "nvs_flash.h"
 
 #include "ble_device_manager.h"
+#include "ble_hid_callbacks.h"
 #include "ble_hid_send.h"
+#include "hid_config.h"
 #include "hid_dev.h"
 #include "hid_device_type_detector.h"
 #include "hid_host_example.h"
 #include "hid_report_parser_c.h"
+#include "keyboard_handler.h"
 #include "led_control.h"
 #include "mouse_accumulator.h"
+#include "usb_hid_types.h"
+#include "usb_hid_recovery.h"
 
 /* =================================================================================================
    MACROS
    =================================================================================================
  */
 #define CHAR_DECLARATION_SIZE (sizeof(uint8_t))
-#define HID_KEYBOARD_IN_RPT_LEN 8
-// 配置选项：使用16位精度（1）或8位精度（0）
-// 注意：Report Map 中 X/Y 定义为 16bit 以兼容 8bit 和 16bit
-// 如果 USE_16BIT_MOUSE_PRECISION=1，发送完整的 16bit 数据
-// 如果 USE_16BIT_MOUSE_PRECISION=0，发送 8bit 数据但放在 16bit 字段中
-// 注意：此宏必须与hid_device_le_prf.c和esp_hidd_prf_api.c中的定义保持一致
-#define USE_16BIT_MOUSE_PRECISION 1
 
-// 基于 Zephyr report map: 按钮(1字节: 3位按钮+5位padding) + X(2字节, 16bit) +
-// Y(2字节, 16bit) + Wheel(1字节) = 6字节 注意：即使发送 8bit 数据，报告长度仍为
-// 6 字节（8bit 数据放在 16bit 字段的低 8 位）
-#define HID_MOUSE_IN_RPT_LEN                                                   \
-  6 // 按钮(1) + X(2) + Y(2) + Wheel(1) = 6字节（兼容 8bit 和 16bit）
-#define HID_CC_IN_RPT_LEN 2
-#define BLE_HID_DEVICE_NAME "BLE HID"
-
-// HID Report ID 相关常量
-// 根据 HID 规范，Report ID 通常是 1 字节（8 位）
-// Parser 返回的 bit_offset 是相对于报告数据开始（不包括 report_id）的
-// 因此如果 report_id 存在，需要调整 8 位以跳过 report_id
-#define HID_REPORT_ID_SIZE_BITS 8 // Report ID 的位宽（1 字节 = 8 位）
+// 注意：HID 报告长度和配置选项已统一定义在 hid_config.h 中
 
 /* =================================================================================================
    VARIABLES, STRUCTS, ENUMS
@@ -123,38 +110,11 @@ static esp_ble_adv_params_t ble_hid_adv_params = {
 
 // USB HOST HID
 static const char *TAG_HID = "HID";
-static const char *TAG_KEYBOARD = "HID Keyboard";
-static const char *TAG_MOUSE = "HID Mouse";
-static const char *TAG_GENERIC = "HID Generic";
 static const char *TAG_USB = "USB";
 
 QueueHandle_t app_event_queue = NULL;
 
-/**
- * @brief APP event group
- *
- * Application logic can be different. There is a one among other ways to
- * distingiush the event by application event group. In this example we have two
- * event groups: APP_EVENT            - General event, which is APP_QUIT_PIN
- * press event (Generally, it is IO0). APP_EVENT_HID_HOST   - HID Host Driver
- * event, such as device connection/disconnection or input report.
- */
-typedef enum { APP_EVENT = 0, APP_EVENT_HID_HOST } app_event_group_t;
-
-/**
- * @brief APP event queue
- *
- * This event is used for delivering the HID Host event from callback to a task.
- */
-typedef struct {
-  app_event_group_t event_group;
-  /* HID Host - Device related info */
-  struct {
-    hid_host_device_handle_t handle;
-    hid_host_driver_event_t event;
-    void *arg;
-  } hid_host_device;
-} app_event_queue_t;
+// 类型定义已移至 usb_hid_types.h
 
 /**
  * @brief HID Protocol string names
@@ -167,22 +127,23 @@ static const char *hid_proto_name_str[] = {
 
 app_event_queue_t evt_queue;
 
-// USB HID设备管理（支持同时连接键盘和鼠标）
-typedef struct {
-  hid_host_device_handle_t keyboard_handle;
-  hid_host_device_handle_t mouse_handle;
-} usb_hid_devices_t;
-
+// USB HID 设备实例（类型定义在 usb_hid_types.h）
 static usb_hid_devices_t usb_hid_devices = {0};
 
 // Parsed layouts for the connected mouse reports (filled when descriptor is
 // available)
-#define MAX_MOUSE_LAYOUTS 16
 static hid_report_layout_t g_mouse_layouts[MAX_MOUSE_LAYOUTS];
 static int g_mouse_layout_count = 0;
-// 缓存当前使用的layout指针，避免每次循环查找
-static hid_report_layout_t *g_cached_layout = NULL;
-static uint8_t g_cached_report_id = 0xFF; // 0xFF表示未缓存
+static bool g_mouse_boot_protocol;
+static uint8_t g_mouse_buttons;
+
+// Recovery requests survive a full event queue. USB callbacks only enqueue;
+// the application task performs control transfers and retries.
+static portMUX_TYPE recovery_lock = portMUX_INITIALIZER_UNLOCKED;
+static hid_host_device_handle_t recovery_handles[2];
+static uint32_t recovery_generation[2];
+static TickType_t recovery_retry_at[2];
+static hid_host_device_handle_t deferred_close_handles[16];
 
 // LED控制
 led_strip_handle_t led_strip = NULL;
@@ -205,8 +166,8 @@ bool mouse_accumulator_is_ble_connected(void) {
  * @brief 通过BLE发送鼠标报告
  */
 esp_err_t mouse_accumulator_send_ble_report(const uint8_t *report,
-                                            uint8_t length) {
-  return ble_hid_send_mouse_report(report, length);
+                                            uint8_t length, uint32_t generation) {
+  return ble_hid_send_mouse_report_for_session(report, length, generation);
 }
 
 /* =================================================================================================
@@ -214,22 +175,14 @@ esp_err_t mouse_accumulator_send_ble_report(const uint8_t *report,
    =================================================================================================
  */
 
-// BLE HID
-static void ble_hid_event_callback(esp_hidd_cb_event_t event,
-                                   esp_hidd_cb_param_t *param);
-static void gap_event_handler(esp_gap_ble_cb_event_t event,
-                              esp_ble_gap_cb_param_t *param);
+// BLE HID 回调函数已移至 ble_hid_callbacks.c/h
 
 // USB HOST HID
 void printBinary(uint8_t value);
-static void
-hid_host_keyboard_report_callback(hid_host_device_handle_t hid_device_handle,
-                                  uint8_t *data, int length);
+// 键盘报告回调已移至 keyboard_handler.c/h
 static void
 hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_handle,
                                uint8_t *data, int length);
-static void hid_host_generic_report_callback(const uint8_t *const data,
-                                             const int length);
 void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
                                      const hid_host_interface_event_t event,
                                      void *arg);
@@ -244,196 +197,7 @@ static void print_usb_device_info(hid_host_device_handle_t hid_device_handle);
 // LED控制辅助函数
 static void update_led_color(void);
 
-/* =================================================================================================
-   BLE HID
-   =================================================================================================
- */
-
-static void ble_hid_event_callback(esp_hidd_cb_event_t event,
-                                   esp_hidd_cb_param_t *param) {
-  switch (event) {
-  case ESP_HIDD_EVENT_REG_FINISH: {
-    if (param->init_finish.state == ESP_HIDD_INIT_OK) {
-      // esp_bd_addr_t rand_addr = {0x04,0x11,0x11,0x11,0x11,0x05};
-      esp_ble_gap_set_device_name(BLE_HID_DEVICE_NAME);
-      esp_ble_gap_config_adv_data(&ble_hid_adv_data);
-    }
-    break;
-  }
-  case ESP_BAT_EVENT_REG: {
-    break;
-  }
-  case ESP_HIDD_EVENT_DEINIT_FINISH:
-    break;
-  case ESP_HIDD_EVENT_BLE_CONNECT: {
-    ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_CONNECT");
-    ble_hid_conn_id = param->connect.conn_id;
-    ESP_LOGI(TAG_BLE, "BLE HID连接ID已设置: conn_id=%d", ble_hid_conn_id);
-
-    // 处理设备管理器连接逻辑（用于已配对设备重连的情况）
-    // 注意：首次配对的设备会在 ESP_GAP_BLE_AUTH_CMPL_EVT 中处理
-    // 但已配对设备重连时可能不会触发 AUTH_CMPL_EVT，需要在这里处理
-    if (ble_device_manager_is_switching()) {
-      ESP_LOGI(TAG_BLE, "检测到正在切换状态，处理设备连接...");
-      ble_device_manager_on_connected(param->connect.remote_bda);
-      update_led_color();
-    }
-
-    // 更新BLE连接参数以提高回报率
-    // min_interval = 0x0006 (7.5ms), max_interval = 0x0006 (7.5ms), latency =
-    // 0, timeout = 500 (625ms) 这些参数请求更短的连接间隔以获得更高的回报率
-    esp_ble_conn_update_params_t conn_params = {0};
-    memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-    conn_params.min_int = 0x0006; // 7.5ms (最小连接间隔)
-    conn_params.max_int =
-        0x0006; // 7.5ms (最大连接间隔，与min相同以获得固定间隔)
-    conn_params.latency = 0;      // 无延迟
-    conn_params.timeout = 0x0320; // 800 * 1.25ms = 1000ms 超时
-    esp_ble_gap_update_conn_params(&conn_params);
-    ESP_LOGI(TAG_BLE, "BLE连接参数已更新: interval=7.5ms, latency=0");
-    break;
-  }
-  case ESP_HIDD_EVENT_BLE_DISCONNECT: {
-    ble_hid_send_enable(false); // 使用线程安全接口禁用发送
-    sec_conn = false;           // 保留用于LED状态显示
-    ble_hid_conn_id = 0;        // 重置连接ID
-    ESP_LOGI(TAG_BLE, "ESP_HID_EVENT_BLE_DISCONNECT");
-
-    // 清理鼠标累加器（避免断线重连后发送旧数据）
-    mouse_accumulator_clear();
-
-    esp_ble_gap_start_advertising(&ble_hid_adv_params);
-    update_led_color();
-    break;
-  }
-  case ESP_HIDD_EVENT_BLE_VENDOR_REPORT_WRITE_EVT: {
-    ESP_LOGI(TAG_BLE, "%s, ESP_HID_EVENT_BLE_VENDOR_REPORT_WRITE_EVT",
-             __func__);
-    ESP_LOG_BUFFER_HEX(TAG_BLE, param->vendor_write.data,
-                       param->vendor_write.length);
-    break;
-  }
-  case ESP_HIDD_EVENT_BLE_LED_REPORT_WRITE_EVT: {
-    // 检查数据长度
-    if (param->led_write.length < 1) {
-      ESP_LOGW(TAG_BLE, "LED报告数据长度不足: %d < 1", param->led_write.length);
-      break;
-    }
-
-    // 解析LED状态位（快速解析，避免阻塞）
-    uint8_t led_state = param->led_write.data[0];
-    bool num_lock = (led_state & 0x01) != 0;
-    bool caps_lock = (led_state & 0x02) != 0;
-    bool scroll_lock = (led_state & 0x04) != 0;
-
-    // 使用简化的日志输出（减少日志开销，避免阻塞BLE回调）
-    ESP_LOGI(TAG_BLE, "收到LED报告: 0x%02X (Num:%s Caps:%s Scroll:%s)",
-             led_state, num_lock ? "ON" : "OFF", caps_lock ? "ON" : "OFF",
-             scroll_lock ? "ON" : "OFF");
-
-    // 快速转发LED报告到USB键盘（如果已连接）
-    // 注意：hid_class_request_set_report可能阻塞，但这是必要的操作
-    // 如果频繁出现问题，可以考虑使用队列异步处理
-    if (usb_hid_devices.keyboard_handle) {
-      // 复制数据到本地缓冲区（避免使用param->led_write.data，因为它可能在回调返回后失效）
-      uint8_t led_data = param->led_write.data[0];
-
-      // 使用Report ID 0发送LED报告（对于Boot Protocol兼容的键盘）
-      // 注意：大多数USB键盘的LED Output Report不使用Report ID
-      esp_err_t ret =
-          hid_class_request_set_report(usb_hid_devices.keyboard_handle,
-                                       HID_REPORT_TYPE_OUTPUT, 0, &led_data, 1);
-      if (ret != ESP_OK) {
-        ESP_LOGW(TAG_BLE, "LED转发失败: %s", esp_err_to_name(ret));
-      } else {
-        ESP_LOGI(TAG_BLE,
-                 "LED转发成功: 0x%02X -> USB键盘 (Num:%s Caps:%s Scroll:%s)",
-                 led_data, (led_data & 0x01) ? "ON" : "OFF",
-                 (led_data & 0x02) ? "ON" : "OFF",
-                 (led_data & 0x04) ? "ON" : "OFF");
-      }
-    } else {
-      ESP_LOGW(TAG_BLE, "USB键盘未连接，无法转发LED报告");
-    }
-    break;
-  }
-  default:
-    break;
-  }
-  return;
-}
-
-static void gap_event_handler(esp_gap_ble_cb_event_t event,
-                              esp_ble_gap_cb_param_t *param) {
-  switch (event) {
-  case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-    esp_ble_gap_start_advertising(&ble_hid_adv_params);
-    break;
-  case ESP_GAP_BLE_SEC_REQ_EVT:
-    for (int i = 0; i < ESP_BD_ADDR_LEN; i++) {
-      ESP_LOGD(TAG_BLE, "%x:", param->ble_security.ble_req.bd_addr[i]);
-    }
-    esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
-    break;
-  case ESP_GAP_BLE_AUTH_CMPL_EVT: {
-    esp_bd_addr_t bd_addr;
-    memcpy(bd_addr, param->ble_security.auth_cmpl.bd_addr,
-           sizeof(esp_bd_addr_t));
-    ESP_LOGI(TAG_BLE, "remote BD_ADDR: %08x%04x",
-             (bd_addr[0] << 24) + (bd_addr[1] << 16) + (bd_addr[2] << 8) +
-                 bd_addr[3],
-             (bd_addr[4] << 8) + bd_addr[5]);
-    ESP_LOGI(TAG_BLE, "address type = %d",
-             param->ble_security.auth_cmpl.addr_type);
-    ESP_LOGI(TAG_BLE, "pair status = %s",
-             param->ble_security.auth_cmpl.success ? "success" : "fail");
-    if (!param->ble_security.auth_cmpl.success) {
-      ESP_LOGE(TAG_BLE, "fail reason = 0x%x",
-               param->ble_security.auth_cmpl.fail_reason);
-    } else {
-      // 认证成功，检查连接是否仍然有效（避免在断开后启用发送）
-      extern hidd_le_env_t hidd_le_env;
-      if (hidd_le_env.hidd_clcb[0].in_use) {
-        ble_hid_send_enable(true); // 使用线程安全接口启用发送
-        sec_conn = true;           // 保留用于LED状态显示
-        // 通知设备管理器处理连接
-        ble_device_manager_on_connected(param->ble_security.auth_cmpl.bd_addr);
-        update_led_color();
-      } else {
-        ESP_LOGW(TAG_BLE,
-                 "AUTH_CMPL but connection already closed, skip enabling send");
-      }
-    }
-    break;
-  }
-  case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
-    // BLE连接参数更新完成事件
-    // 根据实际协商的连接间隔更新鼠标发送间隔
-    if (param->update_conn_params.status == ESP_BT_STATUS_SUCCESS) {
-      uint16_t conn_int = param->update_conn_params.conn_int;
-      uint16_t conn_latency = param->update_conn_params.latency;
-      uint16_t conn_timeout = param->update_conn_params.timeout;
-
-      ESP_LOGI(TAG_BLE,
-               "BLE连接参数更新完成: interval=%d (%.2f ms), latency=%d, "
-               "timeout=%d (%.2f ms)",
-               conn_int, (float)conn_int * 1.25f, conn_latency, conn_timeout,
-               (float)conn_timeout * 1.25f);
-
-      // 根据实际连接间隔更新鼠标发送间隔
-      esp_err_t ret = mouse_accumulator_update_send_interval(conn_int);
-      if (ret != ESP_OK) {
-        ESP_LOGW(TAG_BLE, "更新鼠标发送间隔失败: %s", esp_err_to_name(ret));
-      }
-    } else {
-      ESP_LOGW(TAG_BLE, "BLE连接参数更新失败,状态: 0x%02x",
-               param->update_conn_params.status);
-    }
-    break;
-  default:
-    break;
-  }
-}
+// BLE HID 回调函数实现已移至 ble_hid_callbacks.c
 
 /* =================================================================================================
    USB HID HOST
@@ -451,582 +215,99 @@ void printBinary(uint8_t value) {
   }
 }
 
-// Helper: extract unsigned bits (little-endian bit order) from a byte buffer
-static uint32_t get_bits_u32(const uint8_t *data, int data_len,
-                             uint32_t bit_offset, uint32_t bit_size) {
-  if (bit_size == 0 || bit_size > 32)
-    return 0;
-  uint32_t value = 0;
-  for (uint32_t i = 0; i < bit_size; i++) {
-    uint32_t bit_index = bit_offset + i;
-    uint32_t byte_index = bit_index / 8;
-    uint32_t bit_in_byte = bit_index % 8;
-    if ((int)byte_index >= data_len)
-      break;
-    uint8_t bit = (data[byte_index] >> bit_in_byte) & 0x1;
-    value |= (bit << i);
-  }
-  return value;
+static int32_t clamp_axis(int32_t value, int32_t minimum, int32_t maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
 }
 
-// Helper: extract signed bits and sign-extend to 32-bit
-static int32_t get_bits_s32(const uint8_t *data, int data_len,
-                            uint32_t bit_offset, uint32_t bit_size) {
-  uint32_t u = get_bits_u32(data, data_len, bit_offset, bit_size);
-  if (bit_size == 0)
-    return 0;
-  uint32_t sign_bit = 1u << (bit_size - 1);
-  if (u & sign_bit) {
-    // sign extend
-    uint32_t mask = (~0u) << bit_size;
-    return (int32_t)(u | mask);
+static void hid_host_mouse_report_callback(hid_host_device_handle_t handle,
+                                           uint8_t *data, int length) {
+  if (handle != usb_hid_devices.mouse_handle || data == NULL || length <= 0)
+    return;
+  hid_decoded_mouse_report_t report = {0};
+  if (g_mouse_boot_protocol) {
+    if (length != 3) return;
+    report.buttons = data[0];
+    report.has_buttons = true;
+    report.x = (int8_t)data[1];
+    report.y = (int8_t)data[2];
+  } else if (!hid_decode_mouse_report(g_mouse_layouts, g_mouse_layout_count,
+                                      data, (size_t)length, &report)) {
+    return; // Unknown Report ID or incomplete packet must not become input.
   }
-  return (int32_t)u;
+  if (report.has_buttons) g_mouse_buttons = report.buttons & 0x1f;
+  mouse_accumulator_add((int16_t)clamp_axis(report.x, INT16_MIN, INT16_MAX),
+                        (int16_t)clamp_axis(report.y, INT16_MIN, INT16_MAX),
+                        (int8_t)clamp_axis(report.wheel, INT8_MIN, INT8_MAX),
+                        g_mouse_buttons);
 }
 
-/**
- * @brief 检测槽位切换快捷键 (Alt + `)
- *
- * @param[in] kb_report 键盘报告数据
- * @return true 如果检测到组合键
- */
-static bool
-check_slot_switch_hotkey(const hid_keyboard_input_report_boot_t *kb_report) {
-  // Alt 键: Left Alt = 0x04, Right Alt = 0x40
-  bool alt_pressed = (kb_report->modifier.val & 0x44) != 0;
-  // 反引号键: HID_KEY_GRAVE = 0x35
-  bool grave_pressed = false;
-  for (int i = 0; i < HID_KEYBOARD_KEY_MAX; i++) {
-    if (kb_report->key[i] == 0x35) {
-      grave_pressed = true;
-      break;
-    }
+static void request_recovery(hid_host_device_handle_t handle) {
+  portENTER_CRITICAL(&recovery_lock);
+  int slot = -1;
+  for (int i = 0; i < 2; i++)
+    if (recovery_handles[i] == handle) slot = i;
+  if (slot < 0) {
+    for (int i = 0; i < 2; i++)
+      if (recovery_handles[i] == NULL) { slot = i; break; }
   }
-  return alt_pressed && grave_pressed;
+  if (slot >= 0) {
+    recovery_handles[slot] = handle;
+    recovery_generation[slot]++;
+    recovery_retry_at[slot] = 0;
+  }
+  portEXIT_CRITICAL(&recovery_lock);
+  app_event_queue_t event = {.event_group = APP_EVENT_HID_RECOVER};
+  event.hid_host_device.handle = handle;
+  // The pending table retains the request even if the wake-up queue is full.
+  xQueueSend(app_event_queue, &event, 0);
 }
 
-/**
- * @brief 检测发现新设备快捷键 (Alt + N)
- *
- * @param[in] kb_report 键盘报告数据
- * @return true 如果检测到组合键
- */
-static bool
-check_discover_hotkey(const hid_keyboard_input_report_boot_t *kb_report) {
-  // Alt 键: Left Alt = 0x04, Right Alt = 0x40
-  bool alt_pressed = (kb_report->modifier.val & 0x44) != 0;
-  // N 键: HID_KEY_N = 0x11
-  bool n_pressed = false;
-  for (int i = 0; i < HID_KEYBOARD_KEY_MAX; i++) {
-    if (kb_report->key[i] == 0x11) {
-      n_pressed = true;
+static void defer_interface_close(hid_host_device_handle_t handle) {
+  bool queued = false;
+  portENTER_CRITICAL(&recovery_lock);
+  for (int i = 0; i < 16; i++) {
+    if (deferred_close_handles[i] == handle || deferred_close_handles[i] == NULL) {
+      deferred_close_handles[i] = handle;
+      queued = true;
       break;
     }
   }
-  return alt_pressed && n_pressed;
+  portEXIT_CRITICAL(&recovery_lock);
+  if (!queued) ESP_LOGE(TAG_HID, "Deferred HID close table full");
 }
 
-/**
- * @brief USB HID Host Keyboard Interface report callback handler
- *
- * @param[in] hid_device_handle  HID Device handle
- * @param[in] data    Pointer to input report data buffer
- * @param[in] length  Length of input report data buffer
- */
-static void
-hid_host_keyboard_report_callback(hid_host_device_handle_t hid_device_handle,
-                                  uint8_t *data, int length) {
-  // 检查BLE连接状态
-  if (!ble_hid_send_is_ready()) {
-    // 减少日志输出频率
-    static uint32_t last_skip_log = 0;
-    uint32_t now = xTaskGetTickCount();
-    if (now - last_skip_log > pdMS_TO_TICKS(1000)) {
-      ESP_LOGW(TAG_KEYBOARD, "BLE未就绪，跳过键盘报告发送");
-      last_skip_log = now;
-    }
-    return;
+static void close_disconnected_interfaces(void) {
+  // Serialized with recovery on the app task: a disconnect callback cannot
+  // free an interface record while stop/start is still using its handle.
+  for (int i = 0; i < 16; i++) {
+    portENTER_CRITICAL(&recovery_lock);
+    hid_host_device_handle_t handle = deferred_close_handles[i];
+    deferred_close_handles[i] = NULL;
+    portEXIT_CRITICAL(&recovery_lock);
+    if (handle != NULL) hid_host_device_close(handle);
   }
-
-  // 检查数据长度
-  if (length < sizeof(hid_keyboard_input_report_boot_t)) {
-    ESP_LOGW(TAG_KEYBOARD, "键盘报告长度不足: %d < %zu", length,
-             sizeof(hid_keyboard_input_report_boot_t));
-    return;
-  }
-
-  // 先检测快捷键
-  hid_keyboard_input_report_boot_t *kb_report_check =
-      (hid_keyboard_input_report_boot_t *)data;
-
-  // Alt + ` : 槽位切换
-  if (check_slot_switch_hotkey(kb_report_check)) {
-    ESP_LOGI(TAG_KEYBOARD, "============================================");
-    ESP_LOGI(TAG_KEYBOARD, "检测到槽位切换快捷键 (Alt + `)");
-    ESP_LOGI(TAG_KEYBOARD, "============================================");
-
-    // 先发送一个空的键盘报告来释放所有按键（避免Alt卡住）
-    uint8_t empty_report[HID_KEYBOARD_IN_RPT_LEN] = {0};
-    ble_hid_send_keyboard_report(empty_report, HID_KEYBOARD_IN_RPT_LEN);
-
-    esp_err_t ret = ble_device_manager_switch_slot();
-    if (ret != ESP_OK) {
-      ESP_LOGW(TAG_KEYBOARD, "槽位切换失败: %s", esp_err_to_name(ret));
-    }
-    return; // 不发送此快捷键
-  }
-
-  // Alt + N : 发现新设备
-  if (check_discover_hotkey(kb_report_check)) {
-    ESP_LOGI(TAG_KEYBOARD, "============================================");
-    ESP_LOGI(TAG_KEYBOARD, "检测到发现新设备快捷键 (Alt + N)");
-    ESP_LOGI(TAG_KEYBOARD, "============================================");
-
-    // 先发送一个空的键盘报告来释放所有按键（避免Alt卡住）
-    uint8_t empty_report[HID_KEYBOARD_IN_RPT_LEN] = {0};
-    ble_hid_send_keyboard_report(empty_report, HID_KEYBOARD_IN_RPT_LEN);
-
-    esp_err_t ret = ble_device_manager_discover_new();
-    if (ret != ESP_OK) {
-      ESP_LOGW(TAG_KEYBOARD, "发现新设备失败: %s", esp_err_to_name(ret));
-    }
-    return; // 不发送此快捷键
-  }
-
-  // 再次检查BLE状态（双重检查）
-  if (!ble_hid_send_is_ready()) {
-    return;
-  }
-
-  // 发送键盘报告到BLE（使用线程安全接口）
-  ESP_LOGD(TAG_KEYBOARD, "准备发送键盘报告: length=%d, data[0]=0x%02X",
-           HID_KEYBOARD_IN_RPT_LEN, data[0]);
-  esp_err_t ret = ble_hid_send_keyboard_report(data, HID_KEYBOARD_IN_RPT_LEN);
-  if (ret != ESP_OK) {
-    if (ret != ESP_ERR_INVALID_STATE && ret != ESP_ERR_TIMEOUT) {
-      ESP_LOGW(TAG_KEYBOARD, "发送键盘报告到BLE失败: %s", esp_err_to_name(ret));
-    }
-  } else {
-    ESP_LOGD(TAG_KEYBOARD, "✓ 键盘报告已发送成功");
-  }
-
-  hid_keyboard_input_report_boot_t *kb_report =
-      (hid_keyboard_input_report_boot_t *)data;
-
-#if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
-  if (kb_report->key[0] > 0 || kb_report->modifier.val > 0) {
-    putchar('\n');
-    if (kb_report->modifier.val > 0) {
-      printf("Modifier: ");
-      printBinary(kb_report->modifier.val);
-      putchar('\n');
-    }
-    if (kb_report->key[0] > 0) {
-      printf("Keys: ");
-      putchar('\n');
-      for (int i = 0; i < HID_KEYBOARD_KEY_MAX; i++) {
-        printf("%02X ", kb_report->key[i]);
-      }
-      putchar('\n');
-    }
-  }
-#endif
 }
 
-/**
- * @brief USB HID Host Mouse Interface report callback handler
- *
- * @param[in] hid_device_handle  HID Device handle
- * @param[in] data    Pointer to input report data buffer
- * @param[in] length  Length of input report data buffer
- */
-static void
-hid_host_mouse_report_callback(hid_host_device_handle_t hid_device_handle,
-                               uint8_t *data, int length) {
-  // USB Boot Protocol 鼠标报告格式：按钮(1字节) + X位移(1字节) + Y位移(1字节) =
-  // 3字节 USB Report Protocol 鼠标报告格式：长度可变，可能包含 Report ID
-  //   常见格式1：按钮(1) + X(1) + Y(1) + 滚轮(1) = 4字节
-  //   常见格式2：Report ID(1) + 按钮(1) + X(1) + Y(1) + 滚轮(1) + 其他(3) =
-  //   8字节（macOS常见）
-  // BLE鼠标报告格式（基于 report map，兼容 8bit 和 16bit）：
-  //   按钮(1字节: 5位按钮+3位padding) + X(16位,2字节) + Y(16位,2字节) +
-  //   Wheel(8位,1字节) = 6字节
-
-  if (length < 3) {
-    ESP_LOGW(TAG_MOUSE, "Mouse report too short: %d bytes (minimum 3)", length);
-    return;
-  }
-
-  uint8_t buttons;
-  int16_t x, y; // 改为16位以支持高精度
-  int8_t wheel = 0;
-  static uint8_t last_buttons = 0;
-  buttons = last_buttons; // default to last known buttons state
-
-  // 声明变量供后续打包使用
-  uint32_t buttons_u = 0; // buttons的完整值（可能超过8位）
-  hid_report_layout_t *use_layout =
-      NULL; // 用于判断是否从use_layout路径获取数据
-
-  // 调试日志已移除以提高鼠标回报率性能
-
-  // 根据报告长度自动判断协议类型和格式
-  if (length == sizeof(hid_mouse_input_report_boot_t)) {
-    // Boot Protocol 格式：3字节（按钮+X+Y）
-    hid_mouse_input_report_boot_t *mouse_report =
-        (hid_mouse_input_report_boot_t *)data;
-    buttons = mouse_report->buttons.val;
-    // 8位数据扩展为16位
-    x = (int16_t)mouse_report->x_displacement;
-    y = (int16_t)mouse_report->y_displacement;
-    wheel = 0; // Boot Protocol 不支持滚轮
-    ESP_LOGD(TAG_MOUSE, "Parsed as Boot Protocol (3 bytes)");
-  } else if (length >=
-             5) // 支持基于 Zephyr report map 的5字节格式，以及其他更长的格式
-  {
-    // First, if we have parsed layouts, try to find one matching this packet
-    // (by Report ID or size) use_layout已在函数开始处声明
-    if (g_mouse_layout_count > 0) {
-      uint8_t pid = data[0];
-
-      // 尝试使用缓存的layout（性能优化）
-      if (g_cached_layout != NULL && g_cached_report_id == pid) {
-        // 验证缓存的layout仍然有效
-        if ((uint32_t)length * 8 >= g_cached_layout->report_size_bits) {
-          use_layout = g_cached_layout;
-        } else {
-          // 缓存失效，清除缓存
-          g_cached_layout = NULL;
-          g_cached_report_id = 0xFF;
-        }
-      }
-
-      // 如果缓存未命中，进行查找
-      if (!use_layout) {
-        // try exact report_id match first
-        for (int i = 0; i < g_mouse_layout_count; i++) {
-          if (g_mouse_layouts[i].report_id != 0 &&
-              pid == g_mouse_layouts[i].report_id) {
-            // ensure packet has enough bits
-            if ((uint32_t)length * 8 >= g_mouse_layouts[i].report_size_bits) {
-              use_layout = &g_mouse_layouts[i];
-              // 缓存找到的layout
-              g_cached_layout = use_layout;
-              g_cached_report_id = pid;
-              break;
-            }
-          }
-        }
-        // try report_id == 0 layouts (no report id)
-        if (!use_layout) {
-          for (int i = 0; i < g_mouse_layout_count; i++) {
-            if (g_mouse_layouts[i].report_id == 0 &&
-                (uint32_t)length * 8 >= g_mouse_layouts[i].report_size_bits) {
-              use_layout = &g_mouse_layouts[i];
-              // 缓存找到的layout
-              g_cached_layout = use_layout;
-              g_cached_report_id = 0; // report_id为0的情况
-              break;
-            }
-          }
-        }
-      }
+static void recover_pending_interfaces(void) {
+  usb_hid_recovery_poll();
+  for (int i = 0; i < 2; i++) {
+    portENTER_CRITICAL(&recovery_lock);
+    hid_host_device_handle_t handle = recovery_handles[i];
+    uint32_t generation = recovery_generation[i];
+    TickType_t retry_at = recovery_retry_at[i];
+    portEXIT_CRITICAL(&recovery_lock);
+    if (handle == NULL || (retry_at != 0 &&
+        (int32_t)(xTaskGetTickCount() - retry_at) < 0)) continue;
+    bool registered = handle == usb_hid_devices.keyboard_handle ||
+                      handle == usb_hid_devices.mouse_handle;
+    esp_err_t result = registered ? usb_hid_recover(handle) : ESP_ERR_NOT_FOUND;
+    portENTER_CRITICAL(&recovery_lock);
+    if (generation == recovery_generation[i]) {
+      if (result == ESP_OK || !registered) recovery_handles[i] = NULL;
+      else recovery_retry_at[i] = xTaskGetTickCount() + pdMS_TO_TICKS(250);
     }
-
-    if (use_layout) {
-      // ========================================================================
-      // Bit Offset 调整说明：
-      // ========================================================================
-      // HID Report Parser 返回的 bit_offset 是相对于报告数据开始计算的，
-      // 不包括 report_id。因此：
-      // - 如果 report_id 存在（非 0）：需要调整 bit_offset，跳过 report_id
-      // - 如果 report_id 不存在（0）：不需要调整，bit_offset 从数据开始计算
-      //
-      // 根据 HID 规范，Report ID 通常是 1 字节（8 位）
-      // 参考：hid_report_parser.c 中，当遇到新的 report_id 时，
-      //       current_bit_offset 会被重置为 0（从报告数据开始）
-      // ========================================================================
-      uint32_t bit_offset_adjust = 0;
-      if (use_layout->report_id != 0) {
-        // Report ID 存在，需要跳过 report_id（1 字节 = 8 位）
-        bit_offset_adjust = HID_REPORT_ID_SIZE_BITS;
-
-        // 验证数据长度是否足够（至少包含 report_id + 最小数据）
-        if (length < 2) // 至少需要 report_id(1) + 最小数据(1)
-        {
-          ESP_LOGW(TAG_MOUSE,
-                   "Report data too short: length=%d, expected at least 2 "
-                   "bytes (report_id + data)",
-                   length);
-          return;
-        }
-      }
-      // else: report_id == 0，不需要调整，bit_offset 从数据开始计算
-
-      // ========================================================================
-      // 调试：打印解析出的字段偏移量（仅打印一次）
-      // ========================================================================
-      static bool offset_printed = false;
-      if (!offset_printed) {
-        ESP_LOGI(TAG_MOUSE,
-                 "========== Parsed Mouse Layout Offsets ==========");
-        ESP_LOGI(TAG_MOUSE, "Report ID: %u", use_layout->report_id);
-        ESP_LOGI(TAG_MOUSE, "Bit offset adjust: %" PRIu32 " bits",
-                 bit_offset_adjust);
-        ESP_LOGI(TAG_MOUSE, "Buttons: offset=%" PRIu32 " bits, count=%" PRIu32,
-                 use_layout->buttons_bit_offset + bit_offset_adjust,
-                 use_layout->buttons_count);
-        ESP_LOGI(TAG_MOUSE, "X: offset=%" PRIu32 " bits, size=%" PRIu32 " bits",
-                 use_layout->x_bit_offset + bit_offset_adjust,
-                 use_layout->x_size);
-        ESP_LOGI(TAG_MOUSE, "Y: offset=%" PRIu32 " bits, size=%" PRIu32 " bits",
-                 use_layout->y_bit_offset + bit_offset_adjust,
-                 use_layout->y_size);
-        ESP_LOGI(TAG_MOUSE,
-                 "Wheel: offset=%" PRIu32 " bits, size=%" PRIu32 " bits",
-                 use_layout->wheel_bit_offset + bit_offset_adjust,
-                 use_layout->wheel_size);
-        ESP_LOGI(TAG_MOUSE, "================================================");
-        offset_printed = true;
-      }
-
-      // ========================================================================
-      // Buttons 数据提取（参考 asterics 仓库逻辑）
-      // ========================================================================
-      // 直接提取完整的 buttons 值，不进行中间转换
-      // 在打包时直接使用 buttons_u & 0x1F 获取低5位（支持侧键）
-      // ========================================================================
-      buttons_u = get_bits_u32(
-          data, length, use_layout->buttons_bit_offset + bit_offset_adjust,
-          use_layout->buttons_count);
-      int32_t x_raw =
-          use_layout->x_size
-              ? get_bits_s32(data, length,
-                             use_layout->x_bit_offset + bit_offset_adjust,
-                             use_layout->x_size)
-              : 0;
-      int32_t y_raw =
-          use_layout->y_size
-              ? get_bits_s32(data, length,
-                             use_layout->y_bit_offset + bit_offset_adjust,
-                             use_layout->y_size)
-              : 0;
-      int32_t wheel_raw =
-          use_layout->wheel_size
-              ? get_bits_s32(data, length,
-                             use_layout->wheel_bit_offset + bit_offset_adjust,
-                             use_layout->wheel_size)
-              : 0;
-
-      // ========================================================================
-      // X/Y/Wheel 数据转换（参考 asterics 仓库逻辑）
-      // ========================================================================
-      // 依赖类型转换自动处理，不进行显式 clamp
-      // get_bits_s32() 已经进行了符号扩展，直接转换为目标类型即可
-      // 类型转换会自动处理溢出（截断到目标类型的范围）
-      // ========================================================================
-      x = use_layout->x_size ? (int16_t)x_raw : 0;
-      y = use_layout->y_size ? (int16_t)y_raw : 0;
-      wheel = use_layout->wheel_size ? (int8_t)wheel_raw : 0;
-
-      // 调试日志已禁用以提高鼠标回报率性能
-      // if (x_raw != 0 || y_raw != 0 || wheel_raw != 0)
-      // {
-      //   ESP_LOGI(TAG_MOUSE, "[USB->BLE 数据提取] x_raw=%d -> x=%d, y_raw=%d
-      //   -> y=%d, wheel_raw=%d -> wheel=%d",
-      //            (int)x_raw, (int)x, (int)y_raw, (int)y, (int)wheel_raw,
-      //            (int)wheel);
-      // }
-
-      // 注意：pan（水平滚动）数据在 BLE 报告中不被使用，因此不提取
-      // 参考 asterics 仓库逻辑，不处理 pan 数据
-    } else {
-      // ========================================================================
-      // 回退逻辑：基本的固定偏移解析（参考 asterics 仓库逻辑）
-      // ========================================================================
-      // 简化回退逻辑，只支持基本的固定偏移解析
-      // 不支持 12 位数据的特殊处理，统一使用 8 位数据解析
-      // ========================================================================
-      if (data[0] > 0 && data[0] <= 0x0F) {
-        // 包含 Report ID 的格式：Report ID(1) + Buttons(1) + X(1) + Y(1) +
-        // Wheel(1)
-        if (length >= 5) {
-          buttons = data[1];
-          x = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
-          y = (int16_t)(int8_t)data[3]; // 8位数据扩展为16位
-          wheel = (int8_t)data[4];
-        } else {
-          ESP_LOGW(TAG_MOUSE,
-                   "Report with ID 0x%02X too short: length=%d, expected at "
-                   "least 5 bytes",
-                   data[0], length);
-          return;
-        }
-      } else {
-        // 不包含 Report ID 的格式：Buttons(1) + X(1) + Y(1) + Wheel(1)
-        if (length >= 4) {
-          buttons = data[0];
-          x = (int16_t)(int8_t)data[1]; // 8位数据扩展为16位
-          y = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
-          wheel = (int8_t)data[3];
-        } else {
-          ESP_LOGW(TAG_MOUSE,
-                   "Report without ID too short: length=%d, expected at least "
-                   "4 bytes",
-                   length);
-          return;
-        }
-      }
-    }
-  } else {
-    // ========================================================================
-    // 其他长度的 Report Protocol 格式处理（参考 asterics 仓库逻辑）
-    // ========================================================================
-    // 简化处理逻辑，统一使用基本的固定偏移解析
-    // ========================================================================
-    if (length > 3 && data[0] > 0 && data[0] <= 0x0F) {
-      // 包含 Report ID 的格式：Report ID(1) + Buttons(1) + X(1) + Y(1) +
-      // Wheel(1)
-      if (length >= 5) {
-        buttons = data[1];
-        x = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
-        y = (int16_t)(int8_t)data[3]; // 8位数据扩展为16位
-        wheel = (int8_t)data[4];
-      } else if (length >= 4) {
-        // 至少包含 Report ID + Buttons + X + Y
-        buttons = data[1];
-        x = (int16_t)(int8_t)data[2];
-        y = (int16_t)(int8_t)data[3];
-        wheel = 0; // 无滚轮数据
-      } else {
-        ESP_LOGW(TAG_MOUSE,
-                 "Report Protocol with ID 0x%02X too short: length=%d, "
-                 "expected at least 4 bytes",
-                 data[0], length);
-        return;
-      }
-    } else {
-      // 不包含 Report ID 的格式：Buttons(1) + X(1) + Y(1) + Wheel(1)
-      if (length >= 4) {
-        buttons = data[0];
-        x = (int16_t)(int8_t)data[1]; // 8位数据扩展为16位
-        y = (int16_t)(int8_t)data[2]; // 8位数据扩展为16位
-        wheel = (int8_t)data[3];
-      } else if (length >= 3) {
-        // 至少包含 Buttons + X + Y
-        buttons = data[0];
-        x = (int16_t)(int8_t)data[1];
-        y = (int16_t)(int8_t)data[2];
-        wheel = 0; // 无滚轮数据
-      } else {
-        ESP_LOGW(TAG_MOUSE,
-                 "Report Protocol without ID too short: length=%d, expected at "
-                 "least 3 bytes",
-                 length);
-        return;
-      }
-    }
+    portEXIT_CRITICAL(&recovery_lock);
   }
-
-  // ========================================================================
-  // 新方案：只累加数据到累加器，不直接发送BLE
-  // BLE发送由定时器节拍触发，实现USB输入和BLE发送的彻底解耦
-  // ========================================================================
-
-  // 确定最终的按钮值（取低5位，支持侧键）
-  uint8_t buttons_final;
-  if (use_layout != NULL && use_layout->buttons_count > 0) {
-    // 从 use_layout 路径：直接使用 buttons_u 的低5位
-    buttons_final = (uint8_t)(buttons_u & 0x1F);
-  } else {
-    // 回退路径：使用 buttons 的低5位
-    buttons_final = buttons & 0x1F;
-  }
-
-  // 检测按钮状态变化并打印日志（特别是侧键）
-#if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
-  static uint8_t last_buttons_logged = 0;
-  if (buttons_final != last_buttons_logged) {
-    // 检测各个按钮的状态变化
-    uint8_t changed = buttons_final ^ last_buttons_logged;
-    uint8_t pressed = buttons_final & changed;
-
-    // 打印按钮状态变化
-    if (changed != 0) {
-      // 获取原始按钮值用于调试
-      uint32_t raw_buttons_u =
-          (use_layout != NULL && use_layout->buttons_count > 0) ? buttons_u
-                                                                : buttons;
-      ESP_LOGI(TAG_MOUSE,
-               "[USB 按钮] 状态变化: 0x%02X -> 0x%02X (原始值: 0x%08" PRIX32
-               ", 使用layout: %s)",
-               last_buttons_logged, buttons_final, raw_buttons_u,
-               (use_layout != NULL && use_layout->buttons_count > 0) ? "是"
-                                                                     : "否");
-
-      // 检测每个按钮
-      if (changed & 0x01)
-        ESP_LOGI(TAG_MOUSE, "  Button 1 (左键): %s",
-                 (pressed & 0x01) ? "按下" : "释放");
-      if (changed & 0x02)
-        ESP_LOGI(TAG_MOUSE, "  Button 2 (右键): %s",
-                 (pressed & 0x02) ? "按下" : "释放");
-      if (changed & 0x04)
-        ESP_LOGI(TAG_MOUSE, "  Button 3 (中键): %s",
-                 (pressed & 0x04) ? "按下" : "释放");
-      if (changed & 0x08)
-        ESP_LOGI(TAG_MOUSE, "  Button 4 (侧键1): %s",
-                 (pressed & 0x08) ? "按下" : "释放");
-      if (changed & 0x10)
-        ESP_LOGI(TAG_MOUSE, "  Button 5 (侧键2): %s",
-                 (pressed & 0x10) ? "按下" : "释放");
-
-      // 如果有其他位变化（超出5位范围），也打印出来
-      if (changed & 0xE0) {
-        ESP_LOGI(TAG_MOUSE, "  其他按钮位变化: 0x%02X (超出5键范围)",
-                 changed & 0xE0);
-      }
-    }
-
-    last_buttons_logged = buttons_final;
-  }
-#endif
-
-  // 累加到全局累加器（线程安全）
-  mouse_accumulator_add(x, y, wheel, buttons_final);
-
-  // 保存按钮状态供下次比较
-  last_buttons = buttons_final;
-
-  // 注释：原来的直接发送代码已移除
-  // 现在所有的BLE发送都在 ble_try_send_mouse() 中完成
-  // 该函数由定时器按固定节拍调用，确保发送速率稳定
-}
-
-/**
- * @brief USB HID Host Generic Interface report callback handler
- *
- * 'generic' means anything else than mouse or keyboard
- *
- * @param[in] data    Pointer to input report data buffer
- * @param[in] length  Length of input report data buffer
- */
-static void hid_host_generic_report_callback(const uint8_t *const data,
-                                             const int length) {
-  int report_length_without_report_id = length - 1;
-  if (report_length_without_report_id <= 2) {
-    uint8_t report_data_without_report_id[2] = {0, 0};
-    memcpy(report_data_without_report_id, &data[1],
-           report_length_without_report_id);
-    printf("Maybe Consumer Report\n");
-    hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id, HID_RPT_ID_CC_IN,
-                        HID_REPORT_TYPE_INPUT, report_length_without_report_id,
-                        report_data_without_report_id);
-  }
-  for (int i = 0; i < length; i++) {
-    printf("%02X ", data[i]);
-  }
-  putchar('\n');
 }
 
 /**
@@ -1036,174 +317,56 @@ static void hid_host_generic_report_callback(const uint8_t *const data,
  * @param[in] event              HID Host interface event
  * @param[in] arg                Pointer to arguments, does not used
  */
-void usb_hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
+void usb_hid_host_interface_callback(hid_host_device_handle_t handle,
                                      const hid_host_interface_event_t event,
                                      void *arg) {
-  uint8_t data[64] = {0};
-  size_t data_length = 0;
-  hid_host_dev_params_t dev_params;
-
-  // 对于断开事件，即使获取参数失败也要处理
-  esp_err_t ret = hid_host_device_get_params(hid_device_handle, &dev_params);
-  if (ret != ESP_OK && event != HID_HOST_INTERFACE_EVENT_DISCONNECTED) {
-    ESP_LOGE(TAG_HID, "获取HID设备参数失败: %s", esp_err_to_name(ret));
-    return;
-  }
-
-  // 对于断开事件，如果获取参数失败，尝试通过句柄匹配来清理
-  if (ret != ESP_OK && event == HID_HOST_INTERFACE_EVENT_DISCONNECTED) {
-    ESP_LOGW(TAG_USB,
-             "获取HID设备参数失败（设备可能已断开）: %s，尝试通过句柄清理",
-             esp_err_to_name(ret));
-    // 通过句柄匹配来清理设备
-    if (usb_hid_devices.keyboard_handle == hid_device_handle) {
-      usb_hid_devices.keyboard_handle = NULL;
-      ESP_LOGI(TAG_KEYBOARD, "键盘设备句柄已清除（接口断开，通过句柄匹配）");
-    }
-    if (usb_hid_devices.mouse_handle == hid_device_handle) {
-      usb_hid_devices.mouse_handle = NULL;
-      g_cached_layout = NULL;
-      g_cached_report_id = 0xFF;
-      g_mouse_layout_count = 0;
-      ESP_LOGI(TAG_MOUSE, "鼠标设备句柄已清除（接口断开，通过句柄匹配）");
-    }
-    // 注意：不调用 hid_host_device_close()，原因同下方 DISCONNECTED 事件处理
-    update_led_color();
-    return;
-  }
-
-  // putchar('\n');
-  // ESP_LOGI(TAG_HID, "Interface: %d", dev_params.iface_num);
-
-  // size_t report_desc_len = 0;
-  // uint8_t *report_desc = hid_host_get_report_descriptor(hid_device_handle,
-  // &report_desc_len);
-
-  // putchar('\n');
-  // ESP_LOGI(TAG_HID, "Report descriptor:");
-  // for (size_t i = 0; i < report_desc_len; i++)
-  // {
-  //   printf("%02X ", report_desc[i]);
-  // }
-  // putchar('\n');
-
+  (void)arg;
   switch (event) {
-  case HID_HOST_INTERFACE_EVENT_INPUT_REPORT:
-    ESP_ERROR_CHECK(hid_host_device_get_raw_input_report_data(
-        hid_device_handle, data, 64, &data_length));
-
-    // 根据协议类型和报告长度自动判断协议模式
-    // Boot Protocol 鼠标：3字节（按钮+X+Y）
-    // Boot Protocol 键盘：8字节（修饰键+保留+6个按键）
-    // Report Protocol：长度可变，通常>=4字节
-
-    if (HID_PROTOCOL_KEYBOARD == dev_params.proto) {
-      // 键盘：Boot Protocol 固定8字节，Report Protocol 可能不同长度
-#if defined(CONFIG_DEBUG_KEY_MOUSE_PRESS) && CONFIG_DEBUG_KEY_MOUSE_PRESS
-      if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class &&
-          data_length == 8) {
-        ESP_LOGI(TAG_KEYBOARD, "Keyboard Event (Boot Protocol, len=%d)",
-                 data_length);
-      } else {
-        ESP_LOGI(TAG_KEYBOARD, "Keyboard Event (Report Protocol, len=%d)",
-                 data_length);
-      }
-#endif
-      hid_host_keyboard_report_callback(hid_device_handle, data, data_length);
-    } else if (HID_PROTOCOL_MOUSE == dev_params.proto) {
-      // 鼠标：根据报告长度自动判断协议类型
-      // Boot Protocol: 3字节（按钮+X+Y）
-      // Report Protocol: 4字节或更多（可能包含滚轮、额外按钮等）
-
-      // 已禁用日志以提高性能
-      // bool is_boot_protocol = (HID_SUBCLASS_BOOT_INTERFACE ==
-      // dev_params.sub_class && data_length == 3); if (is_boot_protocol)
-      // {
-      //   ESP_LOGD(TAG_MOUSE, "Mouse Event (Boot Protocol, len=%d)",
-      //   data_length);
-      // }
-      // else
-      // {
-      //   ESP_LOGD(TAG_MOUSE, "Mouse Event (Report Protocol, len=%d)",
-      //   data_length);
-      // }
-      hid_host_mouse_report_callback(hid_device_handle, data, data_length);
-    } else {
-      // 其他协议类型
-      if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class) {
-        ESP_LOGI(TAG_GENERIC, "Generic Boot Interface Event (len=%d)",
-                 data_length);
-      } else {
-        ESP_LOGI(TAG_GENERIC, "Generic Event (Report Protocol, len=%d)",
-                 data_length);
-      }
-      hid_host_generic_report_callback(data, data_length);
-    }
-
+  case HID_HOST_INTERFACE_EVENT_INPUT_REPORT: {
+    uint8_t data[64];
+    size_t length = 0;
+    if (hid_host_device_get_raw_input_report_data(handle, data, sizeof(data),
+                                                 &length) != ESP_OK) return;
+    if (handle == usb_hid_devices.keyboard_handle)
+      hid_host_keyboard_report_callback(handle, data, (int)length);
+    else if (handle == usb_hid_devices.mouse_handle)
+      hid_host_mouse_report_callback(handle, data, (int)length);
     break;
+  }
   case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
-    ESP_LOGI(TAG_USB, "=========================================");
-    ESP_LOGI(TAG_USB, "USB HID接口已断开");
-    ESP_LOGI(TAG_USB, "  设备地址: %d", dev_params.addr);
-    ESP_LOGI(TAG_USB, "  接口号: %d", dev_params.iface_num);
-    ESP_LOGI(TAG_USB, "  协议: %s", hid_proto_name_str[dev_params.proto]);
-    ESP_LOGI(TAG_USB, "=========================================");
-
-    // 从设备列表中移除对应的设备
-    // 注意：需要检查句柄是否匹配，避免清除错误的设备
-    if (dev_params.proto == HID_PROTOCOL_KEYBOARD) {
-      if (usb_hid_devices.keyboard_handle == hid_device_handle) {
-        usb_hid_devices.keyboard_handle = NULL;
-        ESP_LOGI(TAG_KEYBOARD, "键盘设备句柄已清除（接口断开）");
-      }
-    } else if (dev_params.proto == HID_PROTOCOL_MOUSE) {
-      if (usb_hid_devices.mouse_handle == hid_device_handle) {
-        usb_hid_devices.mouse_handle = NULL;
-        // 清除layout缓存
-        g_cached_layout = NULL;
-        g_cached_report_id = 0xFF;
-        g_mouse_layout_count = 0; // 清除所有layout
-        ESP_LOGI(TAG_MOUSE, "鼠标设备句柄已清除（接口断开）");
+    if (handle == usb_hid_devices.keyboard_handle) {
+      keyboard_handler_clear(handle);
+      usb_hid_devices.keyboard_handle = NULL;
+      uint8_t released[HID_KEYBOARD_IN_RPT_LEN] = {0};
+      ble_hid_send_keyboard_report(released, sizeof(released));
+    }
+    if (handle == usb_hid_devices.mouse_handle) {
+      usb_hid_devices.mouse_handle = NULL;
+      g_mouse_layout_count = 0;
+      g_mouse_boot_protocol = false;
+      g_mouse_buttons = 0;
+      mouse_accumulator_add(0, 0, 0, 0);
+      mouse_accumulator_clear();
+    }
+    portENTER_CRITICAL(&recovery_lock);
+    for (int i = 0; i < 2; i++) {
+      if (recovery_handles[i] == handle) {
+        recovery_handles[i] = NULL;
+        recovery_generation[i]++;
       }
     }
-
-    // 注意：不在这里调用 hid_host_device_close()！
-    // HID驱动库在触发 DISCONNECTED 回调之前已经调用过 hid_host_device_close()
-    // 再次调用会导致双重释放内存，引发 LoadProhibited 崩溃
-    // 参考：hid_host.c 中的 hid_host_device_disconnected() ->
-    // hid_host_device_close()
-    //       -> hid_host_user_interface_callback(DISCONNECTED) -> 此回调
-
-    // 更新LED颜色
+    portEXIT_CRITICAL(&recovery_lock);
+    // usb_host_hid 1.0.4 enters WAIT_USER_DELETION and requires a second
+    // application close. Defer that close until app-task recovery has returned.
+    defer_interface_close(handle);
     update_led_color();
     break;
   case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
-    ESP_LOGW(TAG_HID, "HID Device, interface %d protocol '%s' TRANSFER_ERROR",
-             dev_params.iface_num, hid_proto_name_str[dev_params.proto]);
-
-    // Transfer错误时，设备接口可能处于异常状态，无法直接操作
-    // 采用保守策略：只清除应用层句柄，让驱动层自动恢复
-    // 驱动层会在适当时机自动重试或触发重新连接事件
-    if (dev_params.proto == HID_PROTOCOL_KEYBOARD &&
-        usb_hid_devices.keyboard_handle == hid_device_handle) {
-      ESP_LOGW(TAG_KEYBOARD, "键盘设备传输错误，清除句柄（驱动层将自动恢复）");
-      usb_hid_devices.keyboard_handle = NULL;
-      update_led_color();
-    } else if (dev_params.proto == HID_PROTOCOL_MOUSE &&
-               usb_hid_devices.mouse_handle == hid_device_handle) {
-      ESP_LOGW(TAG_MOUSE, "鼠标设备传输错误，清除句柄（驱动层将自动恢复）");
-      usb_hid_devices.mouse_handle = NULL;
-      g_cached_layout = NULL;
-      g_cached_report_id = 0xFF;
-      g_mouse_layout_count = 0;
-      update_led_color();
-    }
-    // 注意：不尝试关闭或重启设备，因为接口状态可能异常
-    // 驱动层会在适当时机自动处理恢复或触发DISCONNECTED事件
+    if (handle == usb_hid_devices.keyboard_handle ||
+        handle == usb_hid_devices.mouse_handle) request_recovery(handle);
     break;
   default:
-    ESP_LOGE(TAG_HID, "HID Device, interface %d protocol '%s' Unhandled event",
-             dev_params.iface_num, hid_proto_name_str[dev_params.proto]);
+    ESP_LOGW(TAG_HID, "Unhandled HID interface event %d", event);
     break;
   }
 }
@@ -1227,7 +390,7 @@ static void print_usb_device_info(hid_host_device_handle_t hid_device_handle) {
   ESP_LOGI(TAG_USB, "  接口号: %d", dev_params.iface_num);
   ESP_LOGI(TAG_USB, "  HID子类: 0x%02X", dev_params.sub_class);
   ESP_LOGI(TAG_USB, "  HID协议: %d (%s)", dev_params.proto,
-           hid_proto_name_str[dev_params.proto]);
+           (dev_params.proto < HID_PROTOCOL_MAX ? hid_proto_name_str[dev_params.proto] : "UNKNOWN"));
   ESP_LOGI(TAG_USB, "=========================================");
 }
 
@@ -1240,193 +403,79 @@ static void print_usb_device_info(hid_host_device_handle_t hid_device_handle) {
  */
 void usb_hid_host_device_event(hid_host_device_handle_t hid_device_handle,
                                const hid_host_driver_event_t event, void *arg) {
-  hid_host_dev_params_t dev_params;
-  ESP_ERROR_CHECK(hid_host_device_get_params(hid_device_handle, &dev_params));
+  (void)arg;
+  if (event != HID_HOST_DRIVER_EVENT_CONNECTED) return;
+  hid_host_dev_params_t params;
+  if (hid_host_device_get_params(hid_device_handle, &params) != ESP_OK) return;
+  print_usb_device_info(hid_device_handle);
+  const hid_host_device_config_t config = {
+      .callback = usb_hid_host_interface_callback, .callback_arg = NULL};
+  if (hid_host_device_open(hid_device_handle, &config) != ESP_OK) return;
 
-  switch (event) {
-  case HID_HOST_DRIVER_EVENT_CONNECTED:
-    ESP_LOGI(TAG_HID, "HID Device Connected");
-    print_usb_device_info(hid_device_handle);
-    printf("address: %d, interface: %d, subclass: %d, protocol: %d %s\n",
-           dev_params.addr, dev_params.iface_num, dev_params.sub_class,
-           dev_params.proto, hid_proto_name_str[dev_params.proto]);
-
-    // 只处理键盘和鼠标接口，跳过其他接口（如厂商自定义接口、protocol=0 NONE等）
-    // 这样可以避免资源耗尽，特别是对于复合设备（Composite Device）
-    if (dev_params.proto != HID_PROTOCOL_KEYBOARD &&
-        dev_params.proto != HID_PROTOCOL_MOUSE) {
-      ESP_LOGI(TAG_HID, "跳过不需要的接口（protocol=%d %s），不进行claim",
-               dev_params.proto, hid_proto_name_str[dev_params.proto]);
-      return;
-    }
-
-    const hid_host_device_config_t dev_config = {
-        .callback = usb_hid_host_interface_callback, .callback_arg = NULL};
-
-    ESP_ERROR_CHECK(hid_host_device_open(hid_device_handle, &dev_config));
-
-    // macOS使用Report Protocol，对所有Boot Interface设备都设置为Report Protocol
-    if (HID_SUBCLASS_BOOT_INTERFACE == dev_params.sub_class) {
-      // 强制使用Report Protocol（macOS兼容）
-      ESP_ERROR_CHECK(hid_class_request_set_protocol(
-          hid_device_handle, HID_REPORT_PROTOCOL_REPORT));
-      ESP_LOGI(TAG_HID, "已设置USB设备为Report Protocol模式（macOS兼容）");
-    }
-    // 非Boot Interface设备默认使用Report Protocol，无需设置
-
-    // 根据协议类型和Report Descriptor验证设备类型
-    // 优先使用Report Descriptor检测，因为它更准确
-    bool is_keyboard_from_desc = false;
-    bool is_mouse_from_desc = false;
-    bool desc_check_success = hid_device_type_detect(
-        hid_device_handle, &is_keyboard_from_desc, &is_mouse_from_desc);
-
-    // 决定设备类型：优先使用Descriptor检测结果，如果失败则回退到协议字段
-    bool should_register_as_keyboard = false;
-    bool should_register_as_mouse = false;
-
-    if (desc_check_success) {
-      // 使用Descriptor检测结果
-      should_register_as_keyboard =
-          is_keyboard_from_desc && !is_mouse_from_desc;
-      should_register_as_mouse = is_mouse_from_desc;
-
-      if (is_keyboard_from_desc && is_mouse_from_desc) {
-        // 如果同时检测到键盘和鼠标，优先使用协议字段
-        ESP_LOGW(TAG_HID, "设备同时包含键盘和鼠标功能，使用协议字段判断");
-        should_register_as_keyboard =
-            (HID_PROTOCOL_KEYBOARD == dev_params.proto);
-        should_register_as_mouse = (HID_PROTOCOL_MOUSE == dev_params.proto);
-      }
-    } else {
-      // Descriptor检测失败，回退到协议字段
-      should_register_as_keyboard = (HID_PROTOCOL_KEYBOARD == dev_params.proto);
-      should_register_as_mouse = (HID_PROTOCOL_MOUSE == dev_params.proto);
-    }
-
-    // 如果Descriptor检测结果与协议字段不一致，记录警告
-    if (desc_check_success) {
-      if (is_mouse_from_desc && HID_PROTOCOL_KEYBOARD == dev_params.proto) {
-        ESP_LOGW(TAG_HID, "警告：协议字段显示为键盘，但Report "
-                          "Descriptor检测为鼠标，将注册为鼠标");
-        should_register_as_keyboard = false;
-        should_register_as_mouse = true;
-      } else if (is_keyboard_from_desc &&
-                 HID_PROTOCOL_MOUSE == dev_params.proto) {
-        ESP_LOGW(TAG_HID, "警告：协议字段显示为鼠标，但Report "
-                          "Descriptor检测为键盘，将注册为键盘");
-        should_register_as_keyboard = true;
-        should_register_as_mouse = false;
-      }
-    }
-
-    // 注册设备
-    if (should_register_as_keyboard) {
-      ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
-      // 保存键盘设备句柄
-      usb_hid_devices.keyboard_handle = hid_device_handle;
-      ESP_LOGI(TAG_KEYBOARD, "键盘设备已注册");
-    } else if (should_register_as_mouse) {
-      ESP_ERROR_CHECK(hid_class_request_set_idle(hid_device_handle, 0, 0));
-      // 保存鼠标设备句柄
-      usb_hid_devices.mouse_handle = hid_device_handle;
-      ESP_LOGI(TAG_MOUSE, "鼠标设备已注册");
-
-      // 获取并打印鼠标的 HID Report Descriptor
-      size_t report_desc_len = 0;
-      const uint8_t *report_desc =
-          hid_host_get_report_descriptor(hid_device_handle, &report_desc_len);
-
-      if (report_desc != NULL && report_desc_len > 0) {
-
-        if (report_desc_len % 16 != 0) {
-          putchar('\n');
-        }
-        ESP_LOGI(TAG_MOUSE, "=========================================");
-
-        // 解析并生成简单的report layout以便后续自动解析数据
-        g_mouse_layout_count = parse_hid_report_descriptor_layouts(
-            report_desc, report_desc_len, g_mouse_layouts, MAX_MOUSE_LAYOUTS);
-        if (g_mouse_layout_count > 0) {
-          for (int i = 0; i < g_mouse_layout_count; i++) {
-            hid_report_layout_t *l = &g_mouse_layouts[i];
-            ESP_LOGI(
-                TAG_MOUSE,
-                "Parsed mouse layout[%d]: report_id=%u, buttons=%u, "
-                "buttons_bit_offset=%u, x: bit=%u size=%u, y: bit=%u size=%u, "
-                "wheel: bit=%u size=%u, pan: bit=%u size=%u",
-                i, (unsigned int)l->report_id, (unsigned int)l->buttons_count,
-                (unsigned int)l->buttons_bit_offset,
-                (unsigned int)l->x_bit_offset, (unsigned int)l->x_size,
-                (unsigned int)l->y_bit_offset, (unsigned int)l->y_size,
-                (unsigned int)l->wheel_bit_offset, (unsigned int)l->wheel_size,
-                (unsigned int)l->pan_bit_offset, (unsigned int)l->pan_size);
-          }
-        } else {
-          ESP_LOGW(TAG_MOUSE, "未能解析到鼠标布局，仍将使用默认/兼容解析逻辑");
-        }
-        // Also run single-layout parser to show what the simpler heuristic
-        // returns
-        {
-          hid_report_layout_t single_layout = {0};
-          int r = parse_hid_report_descriptor_layout(
-              report_desc, report_desc_len, &single_layout);
-          if (r == 0) {
-            ESP_LOGI(TAG_MOUSE,
-                     "parse_hid_report_descriptor_layout -> SUCCESS: "
-                     "report_id=%u, buttons=%u, buttons_bit_offset=%u, x: "
-                     "bit=%u size=%u, y: bit=%u size=%u, wheel: bit=%u "
-                     "size=%u, pan: bit=%u size=%u, report_size_bits=%u",
-                     (unsigned int)single_layout.report_id,
-                     (unsigned int)single_layout.buttons_count,
-                     (unsigned int)single_layout.buttons_bit_offset,
-                     (unsigned int)single_layout.x_bit_offset,
-                     (unsigned int)single_layout.x_size,
-                     (unsigned int)single_layout.y_bit_offset,
-                     (unsigned int)single_layout.y_size,
-                     (unsigned int)single_layout.wheel_bit_offset,
-                     (unsigned int)single_layout.wheel_size,
-                     (unsigned int)single_layout.pan_bit_offset,
-                     (unsigned int)single_layout.pan_size,
-                     (unsigned int)single_layout.report_size_bits);
-          } else {
-            ESP_LOGW(TAG_MOUSE,
-                     "parse_hid_report_descriptor_layout -> no suitable "
-                     "mouse-like report found, first fallback layout: "
-                     "report_id=%u, buttons=%u, x_size=%u, y_size=%u, "
-                     "wheel_size=%u, pan_size=%u, report_size_bits=%u",
-                     (unsigned int)single_layout.report_id,
-                     (unsigned int)single_layout.buttons_count,
-                     (unsigned int)single_layout.x_size,
-                     (unsigned int)single_layout.y_size,
-                     (unsigned int)single_layout.wheel_size,
-                     (unsigned int)single_layout.pan_size,
-                     (unsigned int)single_layout.report_size_bits);
-          }
-        }
-      } else {
-        ESP_LOGW(TAG_MOUSE, "无法获取 HID Report Descriptor (长度: %zu)",
-                 report_desc_len);
-      }
-    }
-
-    int ret = hid_host_device_start(hid_device_handle);
-    if (ret != ESP_OK) {
-      ESP_LOGE(TAG_HID, "启动HID设备失败: %s", esp_err_to_name(ret));
-      // 如果启动失败，清理已注册的设备句柄
-      if (should_register_as_keyboard) {
-        usb_hid_devices.keyboard_handle = NULL;
-      } else if (should_register_as_mouse) {
-        usb_hid_devices.mouse_handle = NULL;
-      }
-      return;
-    }
-    update_led_color();
-    break;
-  default:
-    ESP_LOGW(TAG_HID, "未处理的HID设备事件: %d", event);
-    break;
+  size_t descriptor_length = 0;
+  const uint8_t *descriptor = hid_host_get_report_descriptor(
+      hid_device_handle, &descriptor_length);
+  bool keyboard = false, mouse = false;
+  bool detected = hid_device_type_detect(hid_device_handle, &keyboard, &mouse);
+  if (!detected || (!keyboard && !mouse) || (keyboard && mouse)) {
+    keyboard = params.proto == HID_PROTOCOL_KEYBOARD;
+    mouse = params.proto == HID_PROTOCOL_MOUSE;
   }
+  bool boot_capable = params.sub_class == HID_SUBCLASS_BOOT_INTERFACE;
+  bool report_protocol = !boot_capable || hid_class_request_set_protocol(
+      hid_device_handle, HID_REPORT_PROTOCOL_REPORT) == ESP_OK;
+  bool configured = false;
+  if (keyboard && usb_hid_devices.keyboard_handle == NULL) {
+    if (report_protocol)
+      configured = keyboard_handler_configure(hid_device_handle, descriptor,
+                                               descriptor_length, false);
+    if (!configured && boot_capable && params.proto == HID_PROTOCOL_KEYBOARD &&
+        hid_class_request_set_protocol(hid_device_handle,
+                                        HID_REPORT_PROTOCOL_BOOT) == ESP_OK)
+      configured = keyboard_handler_configure(hid_device_handle, NULL, 0, true);
+    if (configured) usb_hid_devices.keyboard_handle = hid_device_handle;
+  } else if (mouse && usb_hid_devices.mouse_handle == NULL) {
+    g_mouse_layout_count = report_protocol && descriptor ?
+        parse_hid_report_descriptor_layouts(descriptor, descriptor_length,
+                                            g_mouse_layouts, MAX_MOUSE_LAYOUTS) : 0;
+    // The parser also tracks other report IDs; at least one actual axis is required.
+    for (int i = 0; i < g_mouse_layout_count; i++)
+      if (g_mouse_layouts[i].x_size || g_mouse_layouts[i].y_size) configured = true;
+    g_mouse_boot_protocol = false;
+    if (!configured && boot_capable && params.proto == HID_PROTOCOL_MOUSE &&
+        hid_class_request_set_protocol(hid_device_handle,
+                                        HID_REPORT_PROTOCOL_BOOT) == ESP_OK) {
+      configured = true;
+      g_mouse_boot_protocol = true;
+    }
+    if (configured) {
+      g_mouse_buttons = 0;
+      usb_hid_devices.mouse_handle = hid_device_handle;
+    }
+  }
+  if (!configured) {
+    ESP_LOGW(TAG_HID, "Unsupported or duplicate HID interface %u", params.iface_num);
+    hid_host_device_close(hid_device_handle);
+    return;
+  }
+  // SET_IDLE is optional for non-Boot devices. A STALL must not abort startup.
+  hid_class_request_set_idle(hid_device_handle, 0, 0);
+  esp_err_t result = hid_host_device_start(hid_device_handle);
+  if (result != ESP_OK) {
+    ESP_LOGE(TAG_HID, "HID interface start failed: %s", esp_err_to_name(result));
+    if (usb_hid_devices.keyboard_handle == hid_device_handle) {
+      keyboard_handler_clear(hid_device_handle);
+      usb_hid_devices.keyboard_handle = NULL;
+    }
+    if (usb_hid_devices.mouse_handle == hid_device_handle) {
+      usb_hid_devices.mouse_handle = NULL;
+      g_mouse_layout_count = 0;
+      g_mouse_boot_protocol = false;
+      g_mouse_buttons = 0;
+    }
+    hid_host_device_close(hid_device_handle);
+  }
+  update_led_color();
 }
 
 /**
@@ -1575,10 +624,6 @@ void app_main(void) {
     ESP_LOGE(TAG_BLE, "%s init bluedroid failed", __func__);
   }
 
-  /// register the callback function to the gap module
-  esp_ble_gap_register_callback(gap_event_handler);
-  esp_hidd_register_callbacks(ble_hid_event_callback);
-
   /* set the security iocap & auth_req & key size & init key response key
    * parameters to the stack*/
   esp_ble_auth_req_t auth_req =
@@ -1618,6 +663,23 @@ void app_main(void) {
   ret = ble_hid_send_init();
   if (ret != ESP_OK) {
     ESP_LOGE(TAG_BLE, "BLE HID发送管理器初始化失败: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  // Populate callback dependencies before registration can emit any events.
+  led_strip = led_control_init();
+  update_led_color();
+  ESP_ERROR_CHECK(mouse_accumulator_init());
+  ble_hid_callbacks_init(led_strip, &usb_hid_devices, &ble_hid_adv_data,
+                         &ble_hid_adv_params);
+  ble_hid_callbacks_set_led_callback(update_led_color);
+  ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+  ESP_ERROR_CHECK(esp_hidd_register_callbacks(ble_hid_event_callback));
+
+  app_event_queue = xQueueCreate(16, sizeof(app_event_queue_t));
+  if (app_event_queue == NULL) {
+    ESP_LOGE(TAG_HID, "Failed to create event queue");
+    return;
   }
 
   BaseType_t task_created;
@@ -1634,7 +696,8 @@ void app_main(void) {
   assert(task_created == pdTRUE);
 
   // Wait for notification from usb_lib_task to proceed
-  ulTaskNotifyTake(false, 1000);
+  ulTaskNotifyTake(false, portMAX_DELAY);
+  ESP_ERROR_CHECK(usb_hid_recovery_init());
 
   /*
    * HID host driver configuration
@@ -1657,29 +720,15 @@ void app_main(void) {
   }
   ESP_LOGI(TAG_HID, "HID Host驱动已安装");
 
-  // Create queue
-  app_event_queue = xQueueCreate(10, sizeof(app_event_queue_t));
-  if (app_event_queue == NULL) {
-    ESP_LOGE(TAG_HID, "Failed to create event queue");
-    return;
-  }
-
   ESP_LOGI(TAG_HID, "等待USB HID设备连接...");
   ESP_LOGI(TAG_USB, "提示: 请插入USB键盘或鼠标设备");
-
-  // 初始化LED控制模块
-  led_strip = led_control_init();
-  update_led_color();
-
-  // 初始化鼠标累加器模块（创建BLE发送定时器）
-  ESP_ERROR_CHECK(mouse_accumulator_init());
 
   TickType_t last_heartbeat = xTaskGetTickCount();
   const TickType_t heartbeat_interval = pdMS_TO_TICKS(5000); // 5秒心跳
 
   while (1) {
     // Wait queue with timeout for heartbeat
-    TickType_t timeout = pdMS_TO_TICKS(1000); // 1秒超时
+    TickType_t timeout = pdMS_TO_TICKS(20);
     if (xQueueReceive(app_event_queue, &evt_queue, timeout)) {
       if (APP_EVENT_HID_HOST == evt_queue.event_group) {
         ESP_LOGI(TAG_USB, "收到HID Host事件，处理中...");
@@ -1688,6 +737,9 @@ void app_main(void) {
                                   evt_queue.hid_host_device.arg);
       }
     }
+
+    recover_pending_interfaces();
+    close_disconnected_interfaces();
 
     // 心跳日志，确认程序在运行
     TickType_t now = xTaskGetTickCount();

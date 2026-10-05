@@ -39,7 +39,7 @@
 
 // Field flags
 #define FLAG_FIELD_VARIABLE 0x02
-#define FLAG_FIELD_RELATIVE 0x01
+#define FLAG_FIELD_RELATIVE 0x04
 
 // Local flags
 #define FLAG_USAGE_MIN 0x01
@@ -272,8 +272,10 @@ static int process_input_field(parser_state_t *state, const uint8_t *p_data, uin
     return 0; // No layout to fill
   }
 
-  // Calculate bit_size exactly like C++
+  if (state->report_size > 32 || state->report_count > 65535 ||
+      (state->report_count && !state->report_size)) return -1;
   uint32_t bit_size = state->report_size * state->report_count;
+  if (state->current_bit_offset > UINT32_MAX - bit_size) return -1;
 
   // HID specification: If an item has no controls (Report Count = 0),
   // the Local item tags apply to the Main item (usually a collection item).
@@ -296,7 +298,7 @@ static int process_input_field(parser_state_t *state, const uint8_t *p_data, uin
   }
 
   // If no usage ranges, this is padding - skip it but advance bit offset
-  if (!state->num_usage_ranges)
+  if (!state->num_usage_ranges || (flags & 0x01))
   {
     state->current_bit_offset += bit_size;
     return 0;
@@ -335,7 +337,6 @@ static int process_input_field(parser_state_t *state, const uint8_t *p_data, uin
 
   // Now process the field
   bool is_variable = (field_flags & FLAG_FIELD_VARIABLE) != 0;
-  bool is_relative = (field_flags & FLAG_FIELD_RELATIVE) != 0;
 
   // Check if this field has mouse-related usages
   bool has_mouse_usage = false;
@@ -365,7 +366,7 @@ static int process_input_field(parser_state_t *state, const uint8_t *p_data, uin
   }
 
   // Process each usage range
-  // For variable fields: each usage_range corresponds to one item in report_count
+  // For Variable fields, expand each range within Report Count
   // For array fields: usages map to array indices
   uint32_t usage_index = 0;
   for (int i = 0; i < state->num_usage_ranges; i++)
@@ -376,65 +377,55 @@ static int process_input_field(parser_state_t *state, const uint8_t *p_data, uin
 
     if (is_variable)
     {
-      // For variable fields, each usage_range gets one usage_index
-      // We use usage_min as the representative usage for the range
-      // usage_index corresponds to the position in report_count
-      if (usage_index >= state->report_count)
-        break; // No more slots in report_count
-
-      uint32_t field_bit_offset = state->current_bit_offset + (usage_index * state->report_size);
-      usage_index++;
-
-      // Process buttons (Button Page)
-      if (page == PAGE_BUTTON && usage_min >= 1)
+      // Each usage in a Variable range consumes one Report Size field.
+      for (uint32_t usage = usage_min; usage <= usage_max; usage++)
       {
-        if (!state->layout_valid)
+        if (usage_index >= state->report_count)
+          break; // No more slots in report_count
+
+        uint32_t field_bit_offset = state->current_bit_offset + (usage_index * state->report_size);
+        usage_index++;
+
+        // Button state has its own validity, independent of whether axes appeared first.
+        if (page == PAGE_BUTTON && usage >= 1 && state->report_size == 1)
         {
-          state->current_layout->report_id = state->report_id;
-          state->current_layout->buttons_bit_offset = state->current_bit_offset;
-          state->current_layout->buttons_count = state->report_count;
+          if (!state->current_layout->buttons_count)
+            state->current_layout->buttons_bit_offset = field_bit_offset;
+          state->current_layout->buttons_count++;
           state->layout_valid = true;
         }
-        else
+
+        // Process X axis
+        if (page == PAGE_GENERIC_DESKTOP && usage == USAGE_X)
         {
-          // Extend button count if needed
-          if (state->report_count > state->current_layout->buttons_count)
-          {
-            state->current_layout->buttons_count = state->report_count;
-          }
+          state->current_layout->x_bit_offset = field_bit_offset;
+          state->current_layout->x_size = state->report_size;
+          state->layout_valid = true;
         }
-      }
 
-      // Process X axis
-      if (page == PAGE_GENERIC_DESKTOP && usage_min == USAGE_X)
-      {
-        state->current_layout->x_bit_offset = field_bit_offset;
-        state->current_layout->x_size = state->report_size;
-        state->layout_valid = true;
-      }
+        // Process Y axis
+        if (page == PAGE_GENERIC_DESKTOP && usage == USAGE_Y)
+        {
+          state->current_layout->y_bit_offset = field_bit_offset;
+          state->current_layout->y_size = state->report_size;
+          state->layout_valid = true;
+        }
 
-      // Process Y axis
-      if (page == PAGE_GENERIC_DESKTOP && usage_min == USAGE_Y)
-      {
-        state->current_layout->y_bit_offset = field_bit_offset;
-        state->current_layout->y_size = state->report_size;
-        state->layout_valid = true;
-      }
+        // Process wheel (vertical scroll)
+        if (page == PAGE_GENERIC_DESKTOP && usage == USAGE_WHEEL)
+        {
+          state->current_layout->wheel_bit_offset = field_bit_offset;
+          state->current_layout->wheel_size = state->report_size;
+          state->layout_valid = true;
+        }
 
-      // Process wheel (vertical scroll)
-      if (page == PAGE_GENERIC_DESKTOP && usage_min == USAGE_WHEEL)
-      {
-        state->current_layout->wheel_bit_offset = field_bit_offset;
-        state->current_layout->wheel_size = state->report_size;
-        state->layout_valid = true;
-      }
-
-      // Process pan (horizontal scroll) - Consumer Page
-      if (page == PAGE_CONSUMER && usage_min == USAGE_CONSUMER_AC_PAN)
-      {
-        state->current_layout->pan_bit_offset = field_bit_offset;
-        state->current_layout->pan_size = state->report_size;
-        state->layout_valid = true;
+        // Process pan (horizontal scroll) - Consumer Page
+        if (page == PAGE_CONSUMER && usage == USAGE_CONSUMER_AC_PAN)
+        {
+          state->current_layout->pan_bit_offset = field_bit_offset;
+          state->current_layout->pan_size = state->report_size;
+          state->layout_valid = true;
+        }
       }
     }
     else
@@ -530,6 +521,7 @@ static int parse_main_item(parser_state_t *state, uint8_t item, const uint8_t *p
         state->in_mouse_collection = true;
       }
     }
+    reset_locals(state);
     return 0;
   }
 
@@ -815,6 +807,7 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
     memset(&layouts[i], 0, sizeof(hid_report_layout_t));
   }
 
+  if (max_layouts > 16) max_layouts = 16;
   parser_state_t state;
   layout_tracker_t trackers[16];
   int tracker_count = 0;
@@ -826,7 +819,7 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
   const uint8_t *q = p + descriptor_size;
 
   // Start with report ID 0 (no report ID)
-  current_tracker_idx = find_or_create_layout(trackers, &tracker_count, max_layouts, 0);
+  current_tracker_idx = find_or_create_layout(trackers, &tracker_count, 16, 0);
   if (current_tracker_idx >= 0)
   {
     state.current_layout = &trackers[current_tracker_idx].layout;
@@ -840,8 +833,8 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
 
     if (b == ITEM_LONG)
     {
-      if (bytes_left < 1)
-        break;
+      if (bytes_left < 2 || (size_t)p[0] > bytes_left - 2)
+        return 0;
       p += 2 + (size_t)*p;
       continue;
     }
@@ -850,7 +843,7 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
     if (data_size == 3)
       data_size = 4;
     if (bytes_left < data_size)
-      break;
+      return 0;
 
     uint8_t item = b & ITEM_TAG_AND_TYPE_MASK;
 
@@ -865,7 +858,8 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
     case ITEM_TYPE_GLOBAL:
       res = parse_global_item(&state, item, p, data_size);
       // Handle REPORT_ID global item - switch to new layout tracker AFTER processing
-      if (item == ITEM_REPORT_ID && state.report_id != 0)
+      if (res == 0 && (current_tracker_idx < 0 ||
+          state.report_id != trackers[current_tracker_idx].report_id))
       {
         // Save current layout state
         if (current_tracker_idx >= 0 && state.current_layout)
@@ -876,27 +870,23 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
                              state.current_layout->wheel_size > 0 ||
                              state.current_layout->pan_size > 0);
 
-          if (state.layout_valid || has_fields)
-          {
-            trackers[current_tracker_idx].layout = *state.current_layout;
-            trackers[current_tracker_idx].layout.report_size_bits = state.current_bit_offset;
-            trackers[current_tracker_idx].valid = true;
-          }
+          trackers[current_tracker_idx].layout.report_size_bits = state.current_bit_offset;
+          trackers[current_tracker_idx].valid = state.layout_valid || has_fields;
         }
 
         // Switch to new report ID layout
-        int idx = find_or_create_layout(trackers, &tracker_count, max_layouts, state.report_id);
+        int idx = find_or_create_layout(trackers, &tracker_count, 16, state.report_id);
+        if (idx < 0) return 0;
         if (idx >= 0)
         {
           current_tracker_idx = idx;
           state.current_layout = &trackers[idx].layout;
           state.current_layout->report_id = state.report_id;
           // Reset parser state for new report (except globals that persist)
-          state.current_bit_offset = 0;
-          state.first_field_processed = false;
-          state.first_field_has_report_id = false;
-          state.layout_valid = false;
-          reset_locals(&state);
+          state.current_bit_offset = trackers[idx].layout.report_size_bits;
+          state.first_field_processed = state.current_bit_offset != 0;
+          state.first_field_has_report_id = state.report_id != 0;
+          state.layout_valid = trackers[idx].valid;
         }
       }
       break;
@@ -910,9 +900,11 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
     }
 
     if (res != 0)
-      break;
+      return 0;
     p += data_size;
   }
+
+  if (state.collection_depth || state.global_stack_size) return 0;
 
   // Save final layout state
   if (current_tracker_idx >= 0 && state.current_layout)
@@ -954,69 +946,45 @@ int parse_hid_report_descriptor_layouts(const void *descriptor, size_t descripto
 int parse_hid_report_descriptor_layout(const void *descriptor, size_t descriptor_size,
                                        hid_report_layout_t *layout)
 {
-  if (!descriptor || !layout)
-  {
-    return -1;
+  return parse_hid_report_descriptor_layouts(descriptor, descriptor_size, layout, 1) == 1 ? 0 : -1;
+}
+
+static bool read_mouse_bits(const uint8_t *data, size_t length, uint32_t offset,
+                            uint32_t size, bool is_signed, int32_t *value)
+{
+  if (size > 32 || offset > length * 8 || size > length * 8 - offset) return false;
+  uint32_t bits = 0;
+  for (uint32_t i = 0; i < size; i++)
+    bits |= ((uint32_t)((data[(offset + i) / 8] >> ((offset + i) % 8)) & 1)) << i;
+  if (is_signed && size && size < 32 && (bits & (1U << (size - 1))))
+    bits |= ~((1U << size) - 1);
+  *value = (int32_t)bits;
+  return true;
+}
+
+bool hid_decode_mouse_report(const hid_report_layout_t *layouts, int layout_count,
+                             const uint8_t *data, size_t length,
+                             hid_decoded_mouse_report_t *out)
+{
+  if (!layouts || !data || !length || !out) return false;
+  for (int i = 0; i < layout_count; i++) {
+    const hid_report_layout_t *l = &layouts[i];
+    uint32_t prefix = l->report_id ? 8 : 0;
+    if (l->report_id && data[0] != l->report_id) continue;
+    if (length * 8 < (size_t)l->report_size_bits + prefix) return false;
+    int32_t buttons, x, y, wheel;
+    if (!read_mouse_bits(data, length, l->buttons_bit_offset + prefix,
+                         l->buttons_count > 5 ? 5 : l->buttons_count, false, &buttons) ||
+        !read_mouse_bits(data, length, l->x_bit_offset + prefix, l->x_size, true, &x) ||
+        !read_mouse_bits(data, length, l->y_bit_offset + prefix, l->y_size, true, &y) ||
+        !read_mouse_bits(data, length, l->wheel_bit_offset + prefix, l->wheel_size, true, &wheel))
+      return false;
+    out->buttons = (uint8_t)buttons;
+    out->has_buttons = l->buttons_count != 0;
+    out->x = x;
+    out->y = y;
+    out->wheel = wheel;
+    return true;
   }
-
-  parser_state_t state;
-  reset_parser(&state);
-  state.current_layout = layout;
-  layout->report_id = 0;
-
-  const uint8_t *p = (const uint8_t *)descriptor;
-  const uint8_t *q = p + descriptor_size;
-
-  while (p < q)
-  {
-    uint8_t b = *p++;
-    size_t bytes_left = q - p;
-
-    if (b == ITEM_LONG)
-    {
-      if (bytes_left < 1)
-        break;
-      p += 2 + (size_t)*p;
-      continue;
-    }
-
-    uint8_t data_size = b & ITEM_SIZE_MASK;
-    if (data_size == 3)
-      data_size = 4;
-    if (bytes_left < data_size)
-      break;
-
-    uint8_t item = b & ITEM_TAG_AND_TYPE_MASK;
-    int res = 0;
-
-    switch (b & ITEM_TYPE_MASK)
-    {
-    case ITEM_TYPE_MAIN:
-      res = parse_main_item(&state, item, p, data_size);
-      break;
-
-    case ITEM_TYPE_GLOBAL:
-      res = parse_global_item(&state, item, p, data_size);
-      break;
-
-    case ITEM_TYPE_LOCAL:
-      res = parse_local_item(&state, item, p, data_size);
-      break;
-
-    default:
-      break;
-    }
-
-    if (res != 0)
-      break;
-    p += data_size;
-  }
-
-  if (state.layout_valid)
-  {
-    layout->report_size_bits = state.current_bit_offset;
-    return 0;
-  }
-
-  return -1;
+  return false;
 }

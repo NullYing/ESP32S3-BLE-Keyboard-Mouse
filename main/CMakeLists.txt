@@ -10,6 +10,11 @@ idf_component_register(
   "led_control.c"
   "ble_device_manager.c"
   "ble_hid_send.c"
+  "ble_state.c"
+  "ble_hid_callbacks.c"
+  "keyboard_handler.c"
+  "usb_keyboard_report.c"
+  "usb_hid_recovery.c"
   INCLUDE_DIRS
   "."
   PRIV_REQUIRES

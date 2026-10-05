@@ -3,7 +3,7 @@
  *
  * Manages two device slots (A/B) with hotkey switching:
  * - Alt + ` : Switch between Slot A and Slot B
- * - Alt + N : Discover new device and replace current slot
+ * - Alt + N : Discover new device, filling an empty slot first
  */
 
 #ifndef __BLE_DEVICE_MANAGER_H__
@@ -50,7 +50,7 @@ esp_err_t ble_device_manager_switch_slot(void);
  * @brief Start discovering new device (Alt + N)
  *
  * Disconnects current device and waits for new device to connect.
- * New device will replace the current active slot.
+ * New device fills an empty slot, or replaces the active slot if both are full.
  *
  * @return ESP_OK on success
  */
@@ -64,7 +64,13 @@ esp_err_t ble_device_manager_discover_new(void);
  *
  * @param bda Device address
  */
-void ble_device_manager_on_connected(const esp_bd_addr_t bda);
+bool ble_device_manager_on_connected(const esp_bd_addr_t bda);
+
+/** Commit the accepted candidate only after successful authentication. */
+bool ble_device_manager_on_authenticated(const esp_bd_addr_t bda);
+
+/** Discard the candidate, keeping the discovery/switch target intact. */
+void ble_device_manager_on_disconnected(void);
 
 /**
  * @brief Get current active slot (0=A, 1=B)

@@ -12,8 +12,10 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/portmacro.h"
 #include "hid_dev.h"
 #include "hidd_le_prf_int.h"
+#include "mouse_accumulator.h"
 
 static const char *TAG = "BLE_SEND";
 
@@ -26,10 +28,9 @@ static const char *TAG = "BLE_SEND";
 static SemaphoreHandle_t s_send_mutex = NULL;
 
 // 发送使能状态
-static volatile bool s_send_enabled = false;
-
-// 切换/发现锁定状态（由 ble_device_manager 设置）
-static volatile bool s_switching_locked = false;
+static bool s_send_enabled = false;
+static portMUX_TYPE s_state_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static uint16_t s_send_conn_id;
 
 // 外部变量
 extern uint16_t ble_hid_conn_id;
@@ -57,67 +58,46 @@ esp_err_t ble_hid_send_init(void) {
   }
 
   s_send_enabled = false;
-  s_switching_locked = false;
   ESP_LOGI(TAG, "BLE HID 发送管理器已初始化");
   return ESP_OK;
 }
 
 void ble_hid_send_enable(bool enable) {
   if (s_send_mutex == NULL) {
-    ESP_LOGW(TAG, "BLE 发送管理器未初始化");
     return;
   }
-
-  // 使用互斥锁保护状态修改
-  if (xSemaphoreTake(s_send_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    bool old_state = s_send_enabled;
-    s_send_enabled = enable;
-
-    // 如果禁用发送，同时设置切换锁定
-    // 如果启用发送，同时解除切换锁定
-    s_switching_locked = !enable;
-
-    xSemaphoreGive(s_send_mutex);
-
-    if (old_state != enable) {
-      ESP_LOGI(TAG, "BLE 发送状态: %s -> %s (切换锁定: %s)",
-               old_state ? "启用" : "禁用", enable ? "启用" : "禁用",
-               s_switching_locked ? "是" : "否");
-    }
-  } else {
-    // 超时，强制设置（应急处理）
-    s_send_enabled = enable;
-    s_switching_locked = !enable;
-    ESP_LOGW(TAG, "互斥锁超时，强制设置发送状态: %s", enable ? "启用" : "禁用");
+  /* Serialize session changes with an in-flight send. Readiness snapshots
+   * never take this mutex, so transient contention is not a disconnection. */
+  xSemaphoreTake(s_send_mutex, portMAX_DELAY);
+  if (enable && ble_device_manager_is_switching()) {
+    enable = false;
   }
+  portENTER_CRITICAL(&s_state_spinlock);
+  s_send_enabled = enable;
+  if (enable) {
+    s_send_conn_id = ble_hid_conn_id;
+  }
+  portEXIT_CRITICAL(&s_state_spinlock);
+  xSemaphoreGive(s_send_mutex);
 }
 
 bool ble_hid_send_is_ready(void) {
-  // 在没有锁的情况下快速检查（用于频繁调用的场景）
-  // 但这里使用互斥锁确保一致性
-  if (s_send_mutex == NULL)
-    return false;
-
-  bool ready = false;
-
-  // 使用短超时获取锁
-  if (xSemaphoreTake(s_send_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-    ready = s_send_enabled && !s_switching_locked;
-    xSemaphoreGive(s_send_mutex);
-  }
-  // 如果获取锁失败，返回 false（保守策略）
-
-  return ready;
+  portENTER_CRITICAL(&s_state_spinlock);
+  bool ready = s_send_mutex != NULL && s_send_enabled;
+  portEXIT_CRITICAL(&s_state_spinlock);
+  return ready && !ble_device_manager_is_switching();
 }
 
-bool ble_hid_send_get_status(void) { return s_send_enabled; }
+bool ble_hid_send_get_status(void) { return ble_hid_send_is_ready(); }
 
 /**
  * @brief 内部发送函数，带互斥锁保护
  */
 static esp_err_t ble_hid_send_report_internal(uint8_t report_id, uint8_t type,
                                               const uint8_t *report,
-                                              uint8_t length) {
+                                              uint8_t length,
+                                              bool check_session,
+                                              uint32_t generation) {
   if (s_send_mutex == NULL) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -127,10 +107,11 @@ static esp_err_t ble_hid_send_report_internal(uint8_t report_id, uint8_t type,
   // 尝试获取互斥锁（使用短超时避免阻塞）
   if (xSemaphoreTake(s_send_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     // 在锁内检查所有状态（原子性）
-    if (s_send_enabled && !s_switching_locked) {
+    if (ble_hid_send_is_ready()) {
       // 再次检查 ble_device_manager 的状态（双重保险）
-      if (!ble_device_manager_is_switching()) {
-        ret = hid_dev_send_report(hidd_le_env.gatt_if, ble_hid_conn_id,
+      if (!ble_device_manager_is_switching() &&
+          (!check_session || mouse_accumulator_session_is_current(generation))) {
+        ret = hid_dev_send_report(hidd_le_env.gatt_if, s_send_conn_id,
                                   report_id, type, length, (uint8_t *)report);
       }
     }
@@ -146,15 +127,24 @@ static esp_err_t ble_hid_send_report_internal(uint8_t report_id, uint8_t type,
 
 esp_err_t ble_hid_send_mouse_report(const uint8_t *report, uint8_t length) {
   return ble_hid_send_report_internal(HID_RPT_ID_MOUSE_IN,
-                                      HID_REPORT_TYPE_INPUT, report, length);
+                                      HID_REPORT_TYPE_INPUT, report, length,
+                                      false, 0);
+}
+
+esp_err_t ble_hid_send_mouse_report_for_session(const uint8_t *report,
+                                                uint8_t length,
+                                                uint32_t generation) {
+  return ble_hid_send_report_internal(HID_RPT_ID_MOUSE_IN,
+                                      HID_REPORT_TYPE_INPUT, report, length,
+                                      true, generation);
 }
 
 esp_err_t ble_hid_send_keyboard_report(const uint8_t *report, uint8_t length) {
   return ble_hid_send_report_internal(HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT,
-                                      report, length);
+                                      report, length, false, 0);
 }
 
 esp_err_t ble_hid_send_cc_report(const uint8_t *report, uint8_t length) {
   return ble_hid_send_report_internal(HID_RPT_ID_CC_IN, HID_REPORT_TYPE_INPUT,
-                                      report, length);
+                                      report, length, false, 0);
 }

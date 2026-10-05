@@ -51,7 +51,7 @@ extern "C"
       int16_t dx;      // X位移(原始值)
       int16_t dy;      // Y位移(原始值)
       int8_t wheel;    // 滚轮位移
-      uint8_t buttons; // 按钮状态(低3位: 左中右)
+      uint8_t buttons; // 按钮状态(低5位: 左右中及侧键)
       uint8_t flags;   // 标志位: bit0=button_changed
    } mouse_event_t;
 
@@ -61,7 +61,7 @@ extern "C"
    /**
     * @brief Ring buffer结构体
     *
-    * 生产者(USB task): 写入head位置,head++
+    * 生产者(USB task): 写入head位置,head++（满时丢弃新事件）
     * 消费者(BLE task): 读取tail位置,tail++
     * 满条件: count == CAPACITY
     * 空条件: count == 0
@@ -122,9 +122,21 @@ extern "C"
    /**
     * @brief 清理鼠标累加器(用于断线重连等场景)
     *
-    * 清空ring buffer和残差累积器
+    * 清空ring buffer和残差累积器，保留USB当前按钮状态
     */
    void mouse_accumulator_clear(void);
+
+   /**
+    * @brief Set the authenticated connection lifecycle state.
+    *
+    * Disconnect clears relative motion while USB button state remains current.
+    * Reconnect synchronizes that state before accepting queued button edges.
+    * Do not call this for transient send-lock contention or notification readiness.
+    */
+   void mouse_accumulator_set_connected(bool connected);
+
+   /** Validate a snapshot while BLE's send mutex protects its destination. */
+   bool mouse_accumulator_session_is_current(uint32_t generation);
 
    /**
     * @brief USB鼠标数据推入ring buffer(Producer,线程安全)
@@ -135,7 +147,7 @@ extern "C"
     * @param dx X轴位移(int16)
     * @param dy Y轴位移(int16)
     * @param wheel 滚轮位移(int8)
-    * @param buttons 按钮状态(低3位有效)
+    * @param buttons 按钮状态(低5位有效)
     */
    void mouse_accumulator_add(int16_t dx, int16_t dy, int8_t wheel, uint8_t buttons);
 
@@ -152,13 +164,12 @@ extern "C"
     * @brief 从ring buffer取事件并通过BLE发送(Consumer,内部使用)
     *
     * 核心发送逻辑(方案A):
-    * 1. 确定时间窗: [t_last_send, t_now]
-    * 2. 预览阶段: 遍历ring,计算窗内事件的积分(sum_dx/dy/wheel)和按钮状态
-    * 3. 加上残差: sum += residual
-    * 4. 饱和处理: clamp到int16/int8范围,计算新残差
-    * 5. 构建报告并尝试notify
-    * 6. 成功: 提交阶段,真正pop事件,更新t_last_send和residual
-    * 7. 失败: 不pop,保持状态不变,下次重试
+    * 1. 在锁内快照同一按钮状态的事件批次，遇到下一按钮转换停止
+    * 2. 先排空前一批的残差，再发送下一按钮转换
+    * 3. 饱和处理: clamp到int16/int8范围，保留新残差
+    * 4. 锁外尝试notify，临时未就绪保持队列
+    * 5. 成功且连接generation未变: pop快照批次并提交残差
+    * 6. 失败或并发clear: 不提交，防止误删新事件
     *
     * 此函数由定时器回调触发
     */

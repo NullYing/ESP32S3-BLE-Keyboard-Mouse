@@ -30,7 +30,7 @@ extern "C"
    * @param length 报告长度（应为6）
    * @return ESP_OK 成功，其他值表示失败
    */
-  esp_err_t mouse_accumulator_send_ble_report(const uint8_t *report, uint8_t length);
+  esp_err_t mouse_accumulator_send_ble_report(const uint8_t *report, uint8_t length, uint32_t generation);
 
 #ifdef __cplusplus
 }

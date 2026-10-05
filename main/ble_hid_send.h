@@ -62,6 +62,11 @@ bool ble_hid_send_is_ready(void);
  */
 esp_err_t ble_hid_send_mouse_report(const uint8_t *report, uint8_t length);
 
+/** Reject mouse batches captured before the current authenticated session. */
+esp_err_t ble_hid_send_mouse_report_for_session(const uint8_t *report,
+                                                uint8_t length,
+                                                uint32_t generation);
+
 /**
  * @brief 发送键盘报告（线程安全）
  *

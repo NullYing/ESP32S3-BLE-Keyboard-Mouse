@@ -53,6 +53,18 @@ extern "C"
     uint32_t pan_size;       // Size in bits of pan
   } hid_report_layout_t;
 
+  typedef struct {
+    uint8_t buttons;
+    bool has_buttons;
+    int32_t x, y, wheel;
+  } hid_decoded_mouse_report_t;
+
+  // Select by descriptor Report ID; offsets exclude the optional ID byte.
+  // Reject unknown IDs, truncated reports, and unsupported field widths.
+  bool hid_decode_mouse_report(const hid_report_layout_t *layouts, int layout_count,
+                               const uint8_t *data, size_t length,
+                               hid_decoded_mouse_report_t *out);
+
   /**
    * @brief Parse HID report descriptor and extract multiple mouse layouts
    *
