@@ -1,4 +1,27 @@
 menu "BLE_keyboard_mouse"
+    config STATUS_LED_GPIO
+        int "WS2812 status LED GPIO"
+        range 0 61 if IDF_TARGET_ESP32S31
+        range 0 48 if IDF_TARGET_ESP32S3
+        default 60 if IDF_TARGET_ESP32S31
+        default 48
+        help
+            ESP32-S31-Function-CoreBoard-1 uses GPIO60.
+            ESP32-S3-DevKitC-1 uses GPIO48; change this for other boards.
+
+    config STATUS_LED_COLOR_ORDER_GRB
+        bool "Use GRB color order for the WS2812 status LED"
+        default y if IDF_TARGET_ESP32S31
+        default n
+
+    config STATUS_LED_INVERT_OUT
+        bool "Invert the WS2812 status LED data signal"
+        default y if IDF_TARGET_ESP32S31
+        default n
+        help
+            The Function-CoreBoard-1 LED data line passes through an
+            inverting transistor level shifter.
+
     config MODULE_USEJOYSTICK
         bool "Enable BLE-HID joystick"
         default y

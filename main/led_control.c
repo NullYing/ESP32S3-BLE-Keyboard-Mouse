@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_strip.h"
+#include "soc/soc_caps.h"
 #include <stdio.h>
 
 static const char *TAG_LED = "LED";
@@ -22,10 +23,17 @@ led_strip_handle_t led_control_init(void) {
       .max_leds = 1,    // The number of LEDs in the strip,
       .led_model = LED_MODEL_WS2812, // LED strip model
       .color_component_format =
-          LED_STRIP_COLOR_COMPONENT_FMT_RGB, // The color order of the strip:
-                                             // GRB
+#ifdef CONFIG_STATUS_LED_COLOR_ORDER_GRB
+          LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+#else
+          LED_STRIP_COLOR_COMPONENT_FMT_RGB,
+#endif
       .flags = {
-          .invert_out = false, // don't invert the output signal
+#ifdef CONFIG_STATUS_LED_INVERT_OUT
+          .invert_out = true,
+#else
+          .invert_out = false,
+#endif
       }};
 
   // LED strip backend configuration: RMT
@@ -34,7 +42,7 @@ led_strip_handle_t led_control_init(void) {
                                        // different power consumption
       .resolution_hz = LED_RMT_RES_HZ, // RMT counter clock frequency
       .mem_block_symbols =
-          64, // the memory size of each RMT channel, in words (4 bytes)
+          SOC_RMT_MEM_WORDS_PER_CHANNEL,
       .flags = {
           .with_dma =
               false, // DMA feature is available on chips like ESP32-S3/P4

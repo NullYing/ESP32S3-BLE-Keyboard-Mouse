@@ -9,6 +9,7 @@
 
 #include "esp_err.h"
 #include "led_strip.h"
+#include "sdkconfig.h"
 #include <stdbool.h>
 
 
@@ -17,7 +18,7 @@ extern "C" {
 #endif
 
 // LED配置参数
-#define LED_GPIO_PIN GPIO_NUM_48
+#define LED_GPIO_PIN CONFIG_STATUS_LED_GPIO
 #define LED_RMT_RES_HZ (10 * 1000 * 1000)
 #define LED_BRIGHTNESS 25
 

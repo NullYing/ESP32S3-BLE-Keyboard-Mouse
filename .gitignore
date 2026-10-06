@@ -3,3 +3,6 @@ build/
 .devcontainer/
 .vscode/
 sdkconfig.old
+build-s31/
+sdkconfig.s31
+sdkconfig.s31.old
